@@ -1,7 +1,7 @@
 //! Hotkey Manager
 //!
 //! Manages global hotkeys for triggering voice input.
-//! Supports combo keys (Ctrl+Shift+V), double-tap of modifier keys (Ctrl), and tap/hold keys (Fn).
+//! Supports combo keys (Ctrl+Shift+V), double-tap of modifier keys (Ctrl), and tap/hold keys (Ctrl).
 
 use anyhow::{anyhow, Result};
 use global_hotkey::{
@@ -22,7 +22,7 @@ pub enum HotkeyMode {
     Combo,
     /// Double-tap mode (e.g., double-tap Ctrl)
     DoubleTap,
-    /// Tap/hold mode (e.g., tap Fn to toggle, hold Fn to record until released)
+    /// Tap/hold mode (e.g., tap Ctrl to toggle, hold Ctrl to record until released)
     TapHold,
 }
 
@@ -369,13 +369,6 @@ fn run_tap_hold_hook(
         }
     };
 
-    if key.eq_ignore_ascii_case("fn") {
-        tracing::warn!(
-            "Fn keys are not exposed as standard Windows virtual keys on many keyboards; \
-             if Fn does not trigger, configure tap_hold_key to another key."
-        );
-    }
-
     tracing::info!("Starting keyboard hook for tap/hold {} detection", key);
 
     thread_local! {
@@ -483,7 +476,11 @@ fn parse_tap_hold_virtual_keys(key: &str) -> Result<Vec<u16>> {
 
     let key_upper = key.trim().to_uppercase();
     let vks = match key_upper.as_str() {
-        "FN" => vec![0xFF],
+        "FN" => {
+            return Err(anyhow!(
+                "Fn is not exposed as a standard Windows virtual key; use a hookable key such as Ctrl, Shift, Alt, Space, Esc, Enter, A-Z, 0-9, or F1-F24"
+            ));
+        }
         "CTRL" | "CONTROL" => vec![VK_CONTROL.0, VK_LCONTROL.0, VK_RCONTROL.0],
         "SHIFT" => vec![VK_SHIFT.0, VK_LSHIFT.0, VK_RSHIFT.0],
         "ALT" => vec![VK_MENU.0, VK_LMENU.0, VK_RMENU.0],
