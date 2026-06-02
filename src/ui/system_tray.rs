@@ -68,7 +68,7 @@ pub async fn run_app(
 
     let _tray_icon = TrayIconBuilder::new()
         .with_menu(Box::new(menu))
-        .with_tooltip("豆包语音输入 - 点击/按住Fn开始")
+        .with_tooltip("豆包语音输入 - 点击/按住 Ctrl 开始")
         .with_icon(icon)
         .build()?;
 
@@ -183,7 +183,7 @@ pub async fn run_app(
                         unsafe {
                             MessageBoxW(
                                 None,
-                                w!("豆包语音输入 设置\n\n快捷键: 点击 Fn 开始/停止录音，按住 Fn 开始、松开结束\n悬浮按钮: 点击切换录音状态\n\n配置文件: config.toml"),
+                                w!("豆包语音输入 设置\n\n快捷键: 点击 Ctrl 开始/停止录音，按住 Ctrl 开始、松开结束\n状态窗口: 开始录音时出现\n\n配置文件: config.toml"),
                                 w!("设置"),
                                 MB_OK | MB_ICONINFORMATION,
                             );

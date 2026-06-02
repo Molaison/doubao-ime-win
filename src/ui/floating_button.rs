@@ -1,13 +1,13 @@
 //! Floating Button
 //!
-//! A floating button that shows the voice input status and allows user to trigger recording.
+//! A floating status window that appears during voice input and allows stopping recording.
 //! Uses Win32 API with timer-based drag tracking for smooth operation.
 
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicIsize, AtomicU8, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::Arc;
 
-/// Floating button state
+/// Floating status window state
 #[derive(Debug, Clone, Copy, PartialEq)]
 #[repr(u8)]
 pub enum ButtonState {
@@ -56,15 +56,15 @@ impl Default for FloatingButtonConfig {
     }
 }
 
-/// State setter for the floating button (thread-safe)
+/// State setter for the floating status window (thread-safe)
 #[derive(Clone)]
 pub struct FloatingButtonStateSetter {
     state: Arc<AtomicU8>,
-    hwnd: Arc<AtomicI32>,
+    hwnd: Arc<AtomicIsize>,
 }
 
 impl FloatingButtonStateSetter {
-    /// Set the button state
+    /// Set the status window state
     pub fn set_state(&self, state: ButtonState) {
         self.state.store(state as u8, Ordering::SeqCst);
         // Trigger repaint
@@ -75,7 +75,16 @@ impl FloatingButtonStateSetter {
                 unsafe {
                     use windows::Win32::Foundation::*;
                     use windows::Win32::Graphics::Gdi::InvalidateRect;
-                    let hwnd = HWND(hwnd_val as isize);
+                    use windows::Win32::UI::WindowsAndMessaging::{
+                        ShowWindow, SW_HIDE, SW_SHOWNOACTIVATE,
+                    };
+                    let hwnd = HWND(hwnd_val);
+                    let show_command = if state == ButtonState::Idle {
+                        SW_HIDE
+                    } else {
+                        SW_SHOWNOACTIVATE
+                    };
+                    let _ = ShowWindow(hwnd, show_command);
                     let _ = InvalidateRect(hwnd, None, TRUE);
                 }
             }
@@ -89,21 +98,21 @@ impl FloatingButtonStateSetter {
     }
 }
 
-/// Floating button manager
+/// Floating status window manager
 pub struct FloatingButton {
     state: Arc<AtomicU8>,
-    hwnd: Arc<AtomicI32>,
+    hwnd: Arc<AtomicIsize>,
     event_tx: Sender<FloatingButtonEvent>,
     event_rx: Option<Receiver<FloatingButtonEvent>>,
 }
 
 impl FloatingButton {
-    /// Create a new floating button
+    /// Create a new floating status window
     pub fn new() -> Self {
         let (event_tx, event_rx) = channel();
         Self {
             state: Arc::new(AtomicU8::new(ButtonState::Idle as u8)),
-            hwnd: Arc::new(AtomicI32::new(0)),
+            hwnd: Arc::new(AtomicIsize::new(0)),
             event_tx,
             event_rx: Some(event_rx),
         }
@@ -122,17 +131,16 @@ impl FloatingButton {
         self.event_rx.take()
     }
 
-    /// Run the floating button (blocking, call from a dedicated thread)
+    /// Run the floating status window (blocking, call from a dedicated thread)
     #[cfg(target_os = "windows")]
     pub fn run(self, config: FloatingButtonConfig) {
         use std::mem::size_of;
         use windows::core::w;
         use windows::Win32::Foundation::*;
-        
-        use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-        
-        use windows::Win32::UI::WindowsAndMessaging::*;
 
+        use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+
+        use windows::Win32::UI::WindowsAndMessaging::*;
 
         // Thread-local state
         static MOUSE_DOWN: AtomicBool = AtomicBool::new(false);
@@ -196,14 +204,9 @@ impl FloatingButton {
                 };
 
                 let mut bits: *mut std::ffi::c_void = std::ptr::null_mut();
-                if let Ok(hbmp) = CreateDIBSection(
-                    hdc_mem,
-                    &bmi,
-                    DIB_RGB_COLORS,
-                    &mut bits,
-                    None,
-                    0,
-                ) {
+                if let Ok(hbmp) =
+                    CreateDIBSection(hdc_mem, &bmi, DIB_RGB_COLORS, &mut bits, None, 0)
+                {
                     if !bits.is_null() {
                         let old_bmp = SelectObject(hdc_mem, hbmp);
 
@@ -221,7 +224,7 @@ impl FloatingButton {
                             let pg = ((g * a) / 255) as u8;
                             let pb = ((b * a) / 255) as u8;
 
-                            *pixel_data.add(idx) = pb;     // B
+                            *pixel_data.add(idx) = pb; // B
                             *pixel_data.add(idx + 1) = pg; // G
                             *pixel_data.add(idx + 2) = pr; // R
                             *pixel_data.add(idx + 3) = pixel[3]; // A
@@ -236,7 +239,10 @@ impl FloatingButton {
                             AlphaFormat: 1, // AC_SRC_ALPHA
                         };
 
-                        let size = SIZE { cx: img_w as i32, cy: img_h as i32 };
+                        let size = SIZE {
+                            cx: img_w as i32,
+                            cy: img_h as i32,
+                        };
                         let pt_src = POINT { x: 0, y: 0 };
 
                         // Update layered window
@@ -262,7 +268,12 @@ impl FloatingButton {
             }
         }
 
-        unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+        unsafe extern "system" fn wnd_proc(
+            hwnd: HWND,
+            msg: u32,
+            wparam: WPARAM,
+            lparam: LPARAM,
+        ) -> LRESULT {
             use windows::Win32::Foundation::*;
             use windows::Win32::Graphics::Gdi::*;
             use windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
@@ -288,7 +299,10 @@ impl FloatingButton {
                     let _ = BeginPaint(hwnd, &mut ps);
                     // Get current state and update layered window
                     let state_val = SHARED_STATE.with(|s| {
-                        s.borrow().as_ref().map(|st| st.load(Ordering::SeqCst)).unwrap_or(0)
+                        s.borrow()
+                            .as_ref()
+                            .map(|st| st.load(Ordering::SeqCst))
+                            .unwrap_or(0)
                     });
                     update_layered_icon(hwnd, state_val);
                     EndPaint(hwnd, &ps);
@@ -336,7 +350,15 @@ impl FloatingButton {
                             let dy = pt.y - START_CURSOR_Y.load(Ordering::SeqCst);
                             let new_x = START_WIN_X.load(Ordering::SeqCst) + dx;
                             let new_y = START_WIN_Y.load(Ordering::SeqCst) + dy;
-                            let _ = SetWindowPos(hwnd, HWND_TOPMOST, new_x, new_y, 0, 0, SWP_NOSIZE | SWP_NOZORDER);
+                            let _ = SetWindowPos(
+                                hwnd,
+                                HWND_TOPMOST,
+                                new_x,
+                                new_y,
+                                0,
+                                0,
+                                SWP_NOSIZE | SWP_NOZORDER,
+                            );
                         }
                     }
                     LRESULT(0)
@@ -364,7 +386,9 @@ impl FloatingButton {
                 WM_RBUTTONUP => {
                     // Right-click to show exit confirmation
                     use windows::core::w;
-                    use windows::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_YESNO, MB_ICONQUESTION, IDYES};
+                    use windows::Win32::UI::WindowsAndMessaging::{
+                        MessageBoxW, IDYES, MB_ICONQUESTION, MB_YESNO,
+                    };
                     let result = MessageBoxW(
                         hwnd,
                         w!("确定要退出豆包语音输入吗？"),
@@ -386,7 +410,7 @@ impl FloatingButton {
                     PostQuitMessage(0);
                     LRESULT(0)
                 }
-                _ => DefWindowProcW(hwnd, msg, wparam, lparam)
+                _ => DefWindowProcW(hwnd, msg, wparam, lparam),
             }
         }
 
@@ -400,9 +424,8 @@ impl FloatingButton {
             };
 
             let cls = w!("DoubaoFloatingButton");
-            let cursor = LoadCursorW(None, IDC_HAND).unwrap_or_else(|_| {
-                LoadCursorW(None, IDC_ARROW).unwrap_or_default()
-            });
+            let cursor = LoadCursorW(None, IDC_HAND)
+                .unwrap_or_else(|_| LoadCursorW(None, IDC_ARROW).unwrap_or_default());
 
             let wc = WNDCLASSEXW {
                 cbSize: size_of::<WNDCLASSEXW>() as u32,
@@ -419,7 +442,7 @@ impl FloatingButton {
                 WS_EX_LAYERED | WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
                 cls,
                 w!("豆包语音"),
-                WS_POPUP | WS_VISIBLE,
+                WS_POPUP,
                 config.initial_x,
                 config.initial_y,
                 window_size,
@@ -435,10 +458,21 @@ impl FloatingButton {
                 return;
             }
 
-            hwnd_store.store(hwnd.0 as i32, Ordering::SeqCst);
-            tracing::info!("Floating button window created");
+            hwnd_store.store(hwnd.0, Ordering::SeqCst);
+            tracing::info!("Floating status window created");
 
-            let _ = ShowWindow(hwnd, SW_SHOW);
+            let current_state = SHARED_STATE.with(|s| {
+                s.borrow()
+                    .as_ref()
+                    .map(|st| st.load(Ordering::SeqCst))
+                    .unwrap_or(ButtonState::Idle as u8)
+            });
+            let show_command = if current_state == ButtonState::Idle as u8 {
+                SW_HIDE
+            } else {
+                SW_SHOWNOACTIVATE
+            };
+            let _ = ShowWindow(hwnd, show_command);
 
             let mut msg = MSG::default();
             while GetMessageW(&mut msg, HWND::default(), 0, 0).as_bool() {
@@ -446,7 +480,7 @@ impl FloatingButton {
                 DispatchMessageW(&msg);
             }
 
-            tracing::info!("Floating button window closed");
+            tracing::info!("Floating status window closed");
         }
     }
 

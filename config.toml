@@ -17,12 +17,12 @@ double_tap_key = "Ctrl"
 # 双击间隔 (毫秒)
 double_tap_interval = 300
 # 点击/按住键 (当 mode = "tap_hold" 时生效；点击切换，按住启动、松开结束)
-tap_hold_key = "Fn"
+tap_hold_key = "Ctrl"
 # 按住判定阈值 (毫秒)
 tap_hold_threshold = 300
 
 [floating_button]
-# 是否显示悬浮按钮
+# 是否启用录音状态窗口（开始录音时出现）
 enabled = true
 # 悬浮按钮位置 (像素)
 position_x = 100
