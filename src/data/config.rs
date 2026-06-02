@@ -107,10 +107,14 @@ pub struct HotkeyConfig {
     pub double_tap_key: String,
     #[serde(default = "default_double_tap_interval")]
     pub double_tap_interval: u64,
+    #[serde(default = "default_tap_hold_key")]
+    pub tap_hold_key: String,
+    #[serde(default = "default_tap_hold_threshold")]
+    pub tap_hold_threshold: u64,
 }
 
 fn default_hotkey_mode() -> String {
-    "combo".to_string()
+    "tap_hold".to_string()
 }
 
 fn default_combo_key() -> String {
@@ -125,6 +129,14 @@ fn default_double_tap_interval() -> u64 {
     300
 }
 
+fn default_tap_hold_key() -> String {
+    "Fn".to_string()
+}
+
+fn default_tap_hold_threshold() -> u64 {
+    300
+}
+
 impl Default for HotkeyConfig {
     fn default() -> Self {
         Self {
@@ -132,6 +144,8 @@ impl Default for HotkeyConfig {
             combo_key: default_combo_key(),
             double_tap_key: default_double_tap_key(),
             double_tap_interval: default_double_tap_interval(),
+            tap_hold_key: default_tap_hold_key(),
+            tap_hold_threshold: default_tap_hold_threshold(),
         }
     }
 }

@@ -1,7 +1,7 @@
 //! Hotkey Manager
 //!
 //! Manages global hotkeys for triggering voice input.
-//! Supports combo keys (Ctrl+Shift+V) and double-tap of modifier keys (Ctrl).
+//! Supports combo keys (Ctrl+Shift+V), double-tap of modifier keys (Ctrl), and tap/hold keys (Fn).
 
 use anyhow::{anyhow, Result};
 use global_hotkey::{
@@ -22,6 +22,21 @@ pub enum HotkeyMode {
     Combo,
     /// Double-tap mode (e.g., double-tap Ctrl)
     DoubleTap,
+    /// Tap/hold mode (e.g., tap Fn to toggle, hold Fn to record until released)
+    TapHold,
+}
+
+/// Event emitted by a hotkey action
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HotkeyEvent {
+    /// Toggle voice input on or off
+    Toggle,
+    /// Start voice input
+    Start,
+    /// Stop voice input
+    Stop,
+    /// Finish a quick tap in tap/hold mode
+    Tap,
 }
 
 /// Hotkey manager for global hotkey handling
@@ -30,16 +45,22 @@ pub struct HotkeyManager {
     mode: HotkeyMode,
     double_tap_interval: Duration,
     double_tap_key: String,
+    tap_hold_key: String,
+    tap_hold_threshold: Duration,
     is_active: Arc<AtomicBool>,
 }
 
 impl HotkeyManager {
     /// Create a new hotkey manager based on configuration
     pub fn new(config: &HotkeyConfig) -> Result<Self> {
-        let mode = if config.mode == "combo" {
-            HotkeyMode::Combo
-        } else {
-            HotkeyMode::DoubleTap
+        let mode = match config.mode.as_str() {
+            "combo" => HotkeyMode::Combo,
+            "double_tap" => HotkeyMode::DoubleTap,
+            "tap_hold" => HotkeyMode::TapHold,
+            other => {
+                tracing::warn!("Unknown hotkey mode '{}', falling back to tap_hold", other);
+                HotkeyMode::TapHold
+            }
         };
 
         let manager = GlobalHotKeyManager::new()
@@ -56,23 +77,31 @@ impl HotkeyManager {
                 tracing::info!("Registered combo hotkey: {}", config.combo_key);
             }
             HotkeyMode::DoubleTap => {
-                // For modifier keys like Ctrl, we use low-level keyboard hook
-                // For regular keys, we can use global_hotkey
+                // For modifier keys like Ctrl, we use low-level keyboard hook.
+                // For regular keys, we can use global_hotkey.
                 let key_lower = config.double_tap_key.to_lowercase();
                 if key_lower == "ctrl" || key_lower == "shift" || key_lower == "alt" {
-                    // Will use Windows keyboard hook for modifier keys
+                    // Will use Windows keyboard hook for modifier keys.
                     tracing::info!(
                         "Double-tap modifier key: {} (using keyboard hook)",
                         config.double_tap_key
                     );
                 } else {
-                    // Regular key - can use global_hotkey
+                    // Regular key - can use global_hotkey.
                     let hotkey = HotKey::new(None, parse_key_code(&config.double_tap_key)?);
                     manager
                         .register(hotkey)
                         .map_err(|e| anyhow!("Failed to register hotkey: {}", e))?;
                     tracing::info!("Registered double-tap hotkey: {}", config.double_tap_key);
                 }
+            }
+            HotkeyMode::TapHold => {
+                // Tap/hold needs key-down and key-up events, so it is handled by
+                // the Windows low-level keyboard hook instead of global_hotkey.
+                tracing::info!(
+                    "Tap/hold key: {} (tap toggles, hold records until release)",
+                    config.tap_hold_key
+                );
             }
         }
 
@@ -81,33 +110,65 @@ impl HotkeyManager {
             mode,
             double_tap_interval: Duration::from_millis(config.double_tap_interval),
             double_tap_key: config.double_tap_key.clone(),
+            tap_hold_key: config.tap_hold_key.clone(),
+            tap_hold_threshold: Duration::from_millis(config.tap_hold_threshold),
             is_active: Arc::new(AtomicBool::new(true)),
         })
     }
 
-    /// Set callback for when hotkey is triggered
+    /// Set callback for when a toggle-style hotkey is triggered.
     pub fn on_trigger<F>(&self, callback: F)
     where
         F: Fn() + Send + Sync + 'static,
     {
+        self.on_event(move |event| {
+            if event == HotkeyEvent::Toggle {
+                callback();
+            }
+        });
+    }
+
+    /// Set callback for when a hotkey event is emitted.
+    pub fn on_event<F>(&self, callback: F)
+    where
+        F: Fn(HotkeyEvent) + Send + Sync + 'static,
+    {
         let mode = self.mode.clone();
         let double_tap_interval = self.double_tap_interval;
         let double_tap_key = self.double_tap_key.clone();
+        let tap_hold_key = self.tap_hold_key.clone();
+        let tap_hold_threshold = self.tap_hold_threshold;
         let is_active = self.is_active.clone();
-        let callback = Arc::new(callback);
+        let callback: Arc<dyn Fn(HotkeyEvent) + Send + Sync> = Arc::new(callback);
 
         // Check if we need to use keyboard hook for modifier keys
         let key_lower = double_tap_key.to_lowercase();
-        let use_keyboard_hook =
-            mode == HotkeyMode::DoubleTap && (key_lower == "ctrl" || key_lower == "shift" || key_lower == "alt");
+        let use_keyboard_hook = mode == HotkeyMode::DoubleTap
+            && (key_lower == "ctrl" || key_lower == "shift" || key_lower == "alt");
 
-        if use_keyboard_hook {
+        if mode == HotkeyMode::TapHold {
+            #[cfg(target_os = "windows")]
+            {
+                thread::spawn(move || {
+                    run_tap_hold_hook(tap_hold_key, tap_hold_threshold, is_active, callback);
+                });
+            }
+            #[cfg(not(target_os = "windows"))]
+            {
+                tracing::warn!("Tap/hold hotkey mode is only supported on Windows");
+            }
+        } else if use_keyboard_hook {
             // Use Windows keyboard hook for modifier key double-tap
             #[cfg(target_os = "windows")]
             {
                 let callback_clone = callback.clone();
                 thread::spawn(move || {
-                    run_modifier_double_tap_hook(key_lower, double_tap_interval, is_active, callback_clone);
+                    run_modifier_double_tap_hook(
+                        key_lower,
+                        double_tap_interval,
+                        is_active,
+                        callback_clone,
+                    );
                 });
             }
             #[cfg(not(target_os = "windows"))]
@@ -129,7 +190,7 @@ impl HotkeyManager {
                     if let Ok(_event) = receiver.recv() {
                         match mode {
                             HotkeyMode::Combo => {
-                                callback();
+                                callback(HotkeyEvent::Toggle);
                             }
                             HotkeyMode::DoubleTap => {
                                 let now = Instant::now();
@@ -137,7 +198,7 @@ impl HotkeyManager {
                                 if let Some(last) = last_press_time {
                                     let elapsed = now.duration_since(last);
                                     if elapsed <= double_tap_interval {
-                                        callback();
+                                        callback(HotkeyEvent::Toggle);
                                         last_press_time = None;
                                         continue;
                                     }
@@ -145,6 +206,7 @@ impl HotkeyManager {
 
                                 last_press_time = Some(now);
                             }
+                            HotkeyMode::TapHold => unreachable!("tap/hold uses keyboard hook"),
                         }
                     }
                 }
@@ -160,23 +222,20 @@ impl HotkeyManager {
 
 /// Windows keyboard hook for modifier key double-tap detection
 #[cfg(target_os = "windows")]
-fn run_modifier_double_tap_hook<F>(
+fn run_modifier_double_tap_hook(
     key: String,
     interval: Duration,
     is_active: Arc<AtomicBool>,
-    callback: Arc<F>,
-) where
-    F: Fn() + Send + Sync + 'static,
-{
+    callback: Arc<dyn Fn(HotkeyEvent) + Send + Sync>,
+) {
     use std::cell::RefCell;
     use windows::Win32::Foundation::{LPARAM, LRESULT, WPARAM};
     use windows::Win32::UI::Input::KeyboardAndMouse::{
-        VK_CONTROL, VK_LCONTROL, VK_RCONTROL, VK_LSHIFT, VK_RSHIFT, VK_LMENU, VK_RMENU,
+        VK_CONTROL, VK_LCONTROL, VK_LMENU, VK_LSHIFT, VK_RCONTROL, VK_RMENU, VK_RSHIFT,
     };
     use windows::Win32::UI::WindowsAndMessaging::{
         CallNextHookEx, DispatchMessageW, GetMessageW, SetWindowsHookExW, UnhookWindowsHookEx,
-        HHOOK, KBDLLHOOKSTRUCT, MSG, WH_KEYBOARD_LL, WM_KEYUP,
-        WM_SYSKEYUP,
+        HHOOK, KBDLLHOOKSTRUCT, MSG, WH_KEYBOARD_LL, WM_KEYUP, WM_SYSKEYUP,
     };
 
     // Determine which virtual keys to watch
@@ -203,7 +262,7 @@ fn run_modifier_double_tap_hook<F>(
         target_vks: Vec<u16>,
         interval: Duration,
         last_release: Option<Instant>,
-        callback: Arc<dyn Fn() + Send + Sync>,
+        callback: Arc<dyn Fn(HotkeyEvent) + Send + Sync>,
         is_active: Arc<AtomicBool>,
     }
 
@@ -213,7 +272,7 @@ fn run_modifier_double_tap_hook<F>(
             target_vks,
             interval,
             last_release: None,
-            callback: callback as Arc<dyn Fn() + Send + Sync>,
+            callback,
             is_active,
         });
     });
@@ -241,7 +300,7 @@ fn run_modifier_double_tap_hook<F>(
                             if elapsed <= hook_state.interval {
                                 // Double-tap detected!
                                 tracing::info!("Double-tap detected!");
-                                (hook_state.callback)();
+                                (hook_state.callback)(HotkeyEvent::Toggle);
                                 hook_state.last_release = None;
                             } else {
                                 hook_state.last_release = Some(now);
@@ -258,9 +317,7 @@ fn run_modifier_double_tap_hook<F>(
     }
 
     // Install the hook
-    let hook = unsafe {
-        SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard_hook_proc), None, 0)
-    };
+    let hook = unsafe { SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard_hook_proc), None, 0) };
 
     match hook {
         Ok(h) => {
@@ -282,6 +339,174 @@ fn run_modifier_double_tap_hook<F>(
             tracing::error!("Failed to install keyboard hook: {:?}", e);
         }
     }
+}
+
+/// Windows keyboard hook for tap/hold detection.
+///
+/// A key-down always emits `Start`. If the key is released quickly, it emits
+/// `Tap` so the caller can keep a new recording running or stop an existing one.
+/// If the key is held longer than `hold_threshold`, releasing it emits `Stop`.
+#[cfg(target_os = "windows")]
+fn run_tap_hold_hook(
+    key: String,
+    hold_threshold: Duration,
+    is_active: Arc<AtomicBool>,
+    callback: Arc<dyn Fn(HotkeyEvent) + Send + Sync>,
+) {
+    use std::cell::RefCell;
+    use windows::Win32::Foundation::{LPARAM, LRESULT, WPARAM};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        CallNextHookEx, DispatchMessageW, GetMessageW, SetWindowsHookExW, UnhookWindowsHookEx,
+        HHOOK, KBDLLHOOKSTRUCT, MSG, WH_KEYBOARD_LL, WM_KEYDOWN, WM_KEYUP, WM_SYSKEYDOWN,
+        WM_SYSKEYUP,
+    };
+
+    let target_vks = match parse_tap_hold_virtual_keys(&key) {
+        Ok(vks) => vks,
+        Err(e) => {
+            tracing::error!("Invalid tap/hold key '{}': {}", key, e);
+            return;
+        }
+    };
+
+    if key.eq_ignore_ascii_case("fn") {
+        tracing::warn!(
+            "Fn keys are not exposed as standard Windows virtual keys on many keyboards; \
+             if Fn does not trigger, configure tap_hold_key to another key."
+        );
+    }
+
+    tracing::info!("Starting keyboard hook for tap/hold {} detection", key);
+
+    thread_local! {
+        static HOOK_STATE: RefCell<Option<TapHoldHookState>> = RefCell::new(None);
+    }
+
+    struct TapHoldHookState {
+        target_vks: Vec<u16>,
+        hold_threshold: Duration,
+        press_time: Option<Instant>,
+        is_pressed: bool,
+        callback: Arc<dyn Fn(HotkeyEvent) + Send + Sync>,
+        is_active: Arc<AtomicBool>,
+    }
+
+    HOOK_STATE.with(|state| {
+        *state.borrow_mut() = Some(TapHoldHookState {
+            target_vks,
+            hold_threshold,
+            press_time: None,
+            is_pressed: false,
+            callback,
+            is_active,
+        });
+    });
+
+    unsafe extern "system" fn keyboard_hook_proc(
+        code: i32,
+        wparam: WPARAM,
+        lparam: LPARAM,
+    ) -> LRESULT {
+        if code >= 0 {
+            let kb_struct = &*(lparam.0 as *const KBDLLHOOKSTRUCT);
+            let vk_code = kb_struct.vkCode as u16;
+            let message = wparam.0 as u32;
+            let is_key_down = message == WM_KEYDOWN || message == WM_SYSKEYDOWN;
+            let is_key_up = message == WM_KEYUP || message == WM_SYSKEYUP;
+
+            HOOK_STATE.with(|state| {
+                if let Some(ref mut hook_state) = *state.borrow_mut() {
+                    if !hook_state.is_active.load(Ordering::SeqCst)
+                        || !hook_state.target_vks.contains(&vk_code)
+                    {
+                        return;
+                    }
+
+                    if is_key_down && !hook_state.is_pressed {
+                        hook_state.is_pressed = true;
+                        hook_state.press_time = Some(Instant::now());
+                        tracing::info!("Tap/hold key pressed; starting voice input");
+                        (hook_state.callback)(HotkeyEvent::Start);
+                    } else if is_key_up && hook_state.is_pressed {
+                        hook_state.is_pressed = false;
+                        let held_for = hook_state
+                            .press_time
+                            .take()
+                            .map(|pressed_at| Instant::now().duration_since(pressed_at))
+                            .unwrap_or_default();
+
+                        if held_for >= hook_state.hold_threshold {
+                            tracing::info!(
+                                "Tap/hold key released after hold; stopping voice input"
+                            );
+                            (hook_state.callback)(HotkeyEvent::Stop);
+                        } else {
+                            tracing::info!("Tap/hold key tapped");
+                            (hook_state.callback)(HotkeyEvent::Tap);
+                        }
+                    }
+                }
+            });
+        }
+
+        CallNextHookEx(HHOOK::default(), code, wparam, lparam)
+    }
+
+    let hook = unsafe { SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard_hook_proc), None, 0) };
+
+    match hook {
+        Ok(h) => {
+            tracing::info!("Tap/hold keyboard hook installed successfully");
+
+            let mut msg = MSG::default();
+            unsafe {
+                while GetMessageW(&mut msg, None, 0, 0).as_bool() {
+                    DispatchMessageW(&msg);
+                }
+            }
+
+            let _ = unsafe { UnhookWindowsHookEx(h) };
+            tracing::info!("Tap/hold keyboard hook uninstalled");
+        }
+        Err(e) => {
+            tracing::error!("Failed to install tap/hold keyboard hook: {:?}", e);
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn parse_tap_hold_virtual_keys(key: &str) -> Result<Vec<u16>> {
+    use windows::Win32::UI::Input::KeyboardAndMouse::{
+        VK_CONTROL, VK_ESCAPE, VK_LCONTROL, VK_LMENU, VK_LSHIFT, VK_MENU, VK_RCONTROL, VK_RMENU,
+        VK_RSHIFT, VK_SHIFT, VK_SPACE,
+    };
+
+    let key_upper = key.trim().to_uppercase();
+    let vks = match key_upper.as_str() {
+        "FN" => vec![0xFF],
+        "CTRL" | "CONTROL" => vec![VK_CONTROL.0, VK_LCONTROL.0, VK_RCONTROL.0],
+        "SHIFT" => vec![VK_SHIFT.0, VK_LSHIFT.0, VK_RSHIFT.0],
+        "ALT" => vec![VK_MENU.0, VK_LMENU.0, VK_RMENU.0],
+        "SPACE" => vec![VK_SPACE.0],
+        "ESC" | "ESCAPE" => vec![VK_ESCAPE.0],
+        "ENTER" | "RETURN" => vec![0x0D],
+        key if key.len() == 1 && key.as_bytes()[0].is_ascii_alphanumeric() => {
+            vec![key.as_bytes()[0] as u16]
+        }
+        key if key.starts_with('F') => {
+            let number = key[1..]
+                .parse::<u16>()
+                .map_err(|_| anyhow!("Unknown tap/hold key: {}", key))?;
+            if (1..=24).contains(&number) {
+                vec![0x70 + number - 1]
+            } else {
+                return Err(anyhow!("Function key out of range: {}", key));
+            }
+        }
+        _ => return Err(anyhow!("Unknown tap/hold key: {}", key)),
+    };
+
+    Ok(vks)
 }
 
 /// Parse a combo key string like "Ctrl+Shift+V"

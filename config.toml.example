@@ -8,14 +8,18 @@ auto_start = false
 language = "zh-CN"
 
 [hotkey]
-# 热键模式: "combo" (组合键) 或 "double_tap" (双击)
-mode = "combo"
+# 热键模式: "combo" (组合键)、"double_tap" (双击) 或 "tap_hold" (点击/按住)
+mode = "tap_hold"
 # 组合键 (当 mode = "combo" 时生效)
 combo_key = "Ctrl+Shift+V"
 # 双击键 (当 mode = "double_tap" 时生效)
 double_tap_key = "Ctrl"
 # 双击间隔 (毫秒)
 double_tap_interval = 300
+# 点击/按住键 (当 mode = "tap_hold" 时生效；点击切换，按住启动、松开结束)
+tap_hold_key = "Fn"
+# 按住判定阈值 (毫秒)
+tap_hold_threshold = 300
 
 [floating_button]
 # 是否显示悬浮按钮

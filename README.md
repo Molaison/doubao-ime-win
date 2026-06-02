@@ -48,10 +48,12 @@ auto_start = false
 language = "zh-CN"
 
 [hotkey]
-mode = "double_tap"
+mode = "tap_hold"
 combo_key = "Ctrl+Shift+V"
 double_tap_key = "Ctrl"
 double_tap_interval = 300  # 毫秒
+tap_hold_key = "Fn"      # 点击切换；按住启动、松开结束
+tap_hold_threshold = 300 # 按住判定阈值（毫秒）
 
 [floating_button]
 enabled = true
