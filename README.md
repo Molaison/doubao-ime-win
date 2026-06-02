@@ -64,6 +64,31 @@ position_y = 100
 vad_enabled = true
 ```
 
+## 流式输出诊断
+
+如果识别结果总是有“卡顿感”，可以运行 ASR 流式探测示例，测量麦克风采集、WebSocket 响应和 interim/final 结果间隔：
+
+```powershell
+# 默认录音 8 秒，停止录音后最多等待 5 秒收尾
+cargo run --example asr_stream_probe -- --duration 8
+
+# 如需更长语音样本
+cargo run --example asr_stream_probe -- --duration 15 --drain-timeout 8
+```
+
+探测结果会输出：
+- `Interim 流式响应`：大于 0 表示当前会话收到流式增量结果。
+- `首个文本延迟`：从开始录音到首次收到非空识别文本的耗时。
+- `最大响应间隔`：响应之间的最大间隔，可用于判断“卡顿感”是否来自服务端响应不连续。
+- 结论行：直接提示本次会话是流式、疑似非流式，还是未收到文本结果。
+
+运行主程序时也可以开启更详细日志查看发送/接收节奏：
+
+```powershell
+$env:RUST_LOG = "doubao_voice_input=debug"
+cargo run
+```
+
 ## 从源码构建
 
 ### 环境要求

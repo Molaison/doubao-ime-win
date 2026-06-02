@@ -4,7 +4,7 @@
 
 use anyhow::{anyhow, Result};
 use futures_util::{SinkExt, StreamExt};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use uuid::Uuid;
@@ -58,7 +58,10 @@ impl AsrClient {
             .header("Connection", "Upgrade")
             .header("Upgrade", "websocket")
             .header("Sec-WebSocket-Version", "13")
-            .header("Sec-WebSocket-Key", tokio_tungstenite::tungstenite::handshake::client::generate_key())
+            .header(
+                "Sec-WebSocket-Key",
+                tokio_tungstenite::tungstenite::handshake::client::generate_key(),
+            )
             .body(())?;
 
         tracing::info!("Connecting to ASR WebSocket: {}", url);
@@ -107,6 +110,8 @@ impl AsrClient {
         tokio::spawn(async move {
             let mut frame_index = 0u64;
             let start_time = current_time_ms();
+            let send_started_at = Instant::now();
+            let mut last_send_at = send_started_at;
 
             // Process audio frames until channel is closed
             while let Some(opus_frame) = audio_rx.recv().await {
@@ -117,12 +122,8 @@ impl AsrClient {
                 };
 
                 let timestamp_ms = start_time + frame_index * FRAME_DURATION_MS as u64;
-                let msg = build_task_request(
-                    &request_id_clone,
-                    opus_frame,
-                    frame_state,
-                    timestamp_ms,
-                );
+                let msg =
+                    build_task_request(&request_id_clone, opus_frame, frame_state, timestamp_ms);
 
                 if write.send(Message::Binary(msg)).await.is_err() {
                     tracing::warn!("Failed to send audio frame {}", frame_index);
@@ -130,10 +131,28 @@ impl AsrClient {
                 }
 
                 frame_index += 1;
-                
+                let now = Instant::now();
+                let send_gap = now.duration_since(last_send_at);
+                if send_gap > Duration::from_millis(FRAME_DURATION_MS as u64 * 3) {
+                    tracing::warn!(
+                        "Audio frame send gap is high: frame={}, gap_ms={:.1}",
+                        frame_index,
+                        send_gap.as_secs_f64() * 1000.0
+                    );
+                }
+                last_send_at = now;
+
                 // Log every 50 frames (about 1 second)
                 if frame_index % 50 == 0 {
-                    tracing::info!("Sent {} audio frames ({:.1}s)", frame_index, frame_index as f64 * 0.02);
+                    let elapsed = send_started_at.elapsed().as_secs_f64().max(0.001);
+                    let fps = frame_index as f64 / elapsed;
+                    tracing::info!(
+                        "Sent {} audio frames ({:.1}s audio, {:.1} fps over {:.1}s wall time)",
+                        frame_index,
+                        frame_index as f64 * 0.02,
+                        fps,
+                        elapsed
+                    );
                 }
             }
 
@@ -161,12 +180,33 @@ impl AsrClient {
         // Spawn response receiving task
         let result_tx_clone = result_tx.clone();
         tokio::spawn(async move {
+            let receive_started_at = Instant::now();
+            let mut last_response_at: Option<Instant> = None;
+            let mut response_count = 0u64;
+            let mut interim_count = 0u64;
+            let mut final_count = 0u64;
+
             while let Some(Ok(msg)) = read.next().await {
                 if let Message::Binary(data) = msg {
                     let response = parse_response(&data);
+                    response_count += 1;
+                    let now = Instant::now();
+                    let since_start_ms =
+                        now.duration_since(receive_started_at).as_secs_f64() * 1000.0;
+                    let gap_ms = last_response_at
+                        .map(|previous| now.duration_since(previous).as_secs_f64() * 1000.0)
+                        .unwrap_or(0.0);
+                    last_response_at = Some(now);
 
                     match response.response_type {
                         ResponseType::Error | ResponseType::SessionFinished => {
+                            tracing::info!(
+                                "ASR response #{}, type={:?}, since_start_ms={:.1}, gap_ms={:.1}",
+                                response_count,
+                                response.response_type,
+                                since_start_ms,
+                                gap_ms
+                            );
                             let _ = result_tx_clone.send(response).await;
                             break;
                         }
@@ -174,7 +214,43 @@ impl AsrClient {
                             // Ignore heartbeats
                             continue;
                         }
+                        ResponseType::InterimResult => {
+                            interim_count += 1;
+                            tracing::debug!(
+                                "ASR interim #{}, responses={}, since_start_ms={:.1}, gap_ms={:.1}, text_len={}",
+                                interim_count,
+                                response_count,
+                                since_start_ms,
+                                gap_ms,
+                                response.text.chars().count()
+                            );
+                            if result_tx_clone.send(response).await.is_err() {
+                                break;
+                            }
+                        }
+                        ResponseType::FinalResult => {
+                            final_count += 1;
+                            tracing::info!(
+                                "ASR final #{}, responses={}, interim_seen={}, since_start_ms={:.1}, gap_ms={:.1}, text_len={}",
+                                final_count,
+                                response_count,
+                                interim_count,
+                                since_start_ms,
+                                gap_ms,
+                                response.text.chars().count()
+                            );
+                            if result_tx_clone.send(response).await.is_err() {
+                                break;
+                            }
+                        }
                         _ => {
+                            tracing::trace!(
+                                "ASR response #{}, type={:?}, since_start_ms={:.1}, gap_ms={:.1}",
+                                response_count,
+                                response.response_type,
+                                since_start_ms,
+                                gap_ms
+                            );
                             if result_tx_clone.send(response).await.is_err() {
                                 break;
                             }
