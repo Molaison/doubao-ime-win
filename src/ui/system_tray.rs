@@ -11,9 +11,12 @@ use tray_icon::{
     TrayIconBuilder,
 };
 
-use crate::business::{HotkeyManager, VoiceController};
+use crate::business::{HotkeyEvent, HotkeyManager, VoiceController};
 use crate::data::AppConfig;
-use crate::ui::{ButtonState, FloatingButton, FloatingButtonConfig, FloatingButtonEvent};
+use crate::ui::{
+    ButtonState, FloatingButton, FloatingButtonConfig, FloatingButtonEvent,
+    FloatingButtonStateSetter,
+};
 
 /// Run the application with system tray and floating button
 pub async fn run_app(
@@ -65,7 +68,7 @@ pub async fn run_app(
 
     let _tray_icon = TrayIconBuilder::new()
         .with_menu(Box::new(menu))
-        .with_tooltip("豆包语音输入 - 双击Ctrl开始/停止")
+        .with_tooltip("豆包语音输入 - 点击/按住Fn开始")
         .with_icon(icon)
         .build()?;
 
@@ -84,25 +87,49 @@ pub async fn run_app(
     let vc_for_hotkey = voice_controller.clone();
     let state_for_hotkey = button_state_setter.clone();
     let handle_for_hotkey = runtime_handle.clone();
-    _hotkey_manager.on_trigger(move || {
+    let tap_hold_pressed_while_recording = Arc::new(AtomicBool::new(false));
+    _hotkey_manager.on_event(move |hotkey_event| {
         let vc = vc_for_hotkey.clone();
         let setter = state_for_hotkey.clone();
         let handle = handle_for_hotkey.clone();
+        let pressed_while_recording = tap_hold_pressed_while_recording.clone();
         handle.spawn(async move {
             let mut controller = vc.lock().await;
-            if controller.is_recording() {
-                tracing::info!("Hotkey: stopping voice input");
-                setter.set_state(ButtonState::Processing);
-                if let Err(e) = controller.stop().await {
-                    tracing::error!("Failed to stop voice input: {}", e);
+            match hotkey_event {
+                HotkeyEvent::Toggle => {
+                    if controller.is_recording() {
+                        stop_voice_input(&mut controller, &setter, "Hotkey toggle").await;
+                    } else {
+                        start_voice_input(&mut controller, &setter, "Hotkey toggle").await;
+                    }
                 }
-                setter.set_state(ButtonState::Idle);
-            } else {
-                tracing::info!("Hotkey: starting voice input");
-                if let Err(e) = controller.start().await {
-                    tracing::error!("Failed to start voice input: {}", e);
-                } else {
-                    setter.set_state(ButtonState::Recording);
+                HotkeyEvent::Start => {
+                    let was_recording = controller.is_recording();
+                    pressed_while_recording.store(was_recording, Ordering::SeqCst);
+                    if was_recording {
+                        tracing::info!("Hotkey press detected while already recording");
+                    } else {
+                        start_voice_input(&mut controller, &setter, "Hotkey press").await;
+                    }
+                }
+                HotkeyEvent::Stop => {
+                    pressed_while_recording.store(false, Ordering::SeqCst);
+                    if controller.is_recording() {
+                        stop_voice_input(&mut controller, &setter, "Hotkey release").await;
+                    } else {
+                        tracing::info!("Hotkey stop ignored: already idle");
+                    }
+                }
+                HotkeyEvent::Tap => {
+                    if pressed_while_recording.swap(false, Ordering::SeqCst) {
+                        if controller.is_recording() {
+                            stop_voice_input(&mut controller, &setter, "Hotkey tap").await;
+                        } else {
+                            tracing::info!("Hotkey tap ignored: already idle");
+                        }
+                    } else {
+                        tracing::info!("Hotkey tap kept voice input running");
+                    }
                 }
             }
         });
@@ -150,11 +177,13 @@ pub async fn run_app(
                     #[cfg(target_os = "windows")]
                     {
                         use windows::core::w;
-                        use windows::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_OK, MB_ICONINFORMATION};
+                        use windows::Win32::UI::WindowsAndMessaging::{
+                            MessageBoxW, MB_ICONINFORMATION, MB_OK,
+                        };
                         unsafe {
                             MessageBoxW(
                                 None,
-                                w!("豆包语音输入 设置\n\n快捷键: 双击 Ctrl 开始/停止录音\n悬浮按钮: 点击切换录音状态\n\n配置文件: config.toml"),
+                                w!("豆包语音输入 设置\n\n快捷键: 点击 Fn 开始/停止录音，按住 Fn 开始、松开结束\n悬浮按钮: 点击切换录音状态\n\n配置文件: config.toml"),
                                 w!("设置"),
                                 MB_OK | MB_ICONINFORMATION,
                             );
@@ -242,6 +271,33 @@ pub async fn run_app(
     Ok(())
 }
 
+async fn start_voice_input(
+    controller: &mut VoiceController,
+    setter: &FloatingButtonStateSetter,
+    source: &str,
+) {
+    tracing::info!("{}: starting voice input", source);
+    if let Err(e) = controller.start().await {
+        tracing::error!("Failed to start voice input: {}", e);
+        setter.set_state(ButtonState::Idle);
+    } else {
+        setter.set_state(ButtonState::Recording);
+    }
+}
+
+async fn stop_voice_input(
+    controller: &mut VoiceController,
+    setter: &FloatingButtonStateSetter,
+    source: &str,
+) {
+    tracing::info!("{}: stopping voice input", source);
+    setter.set_state(ButtonState::Processing);
+    if let Err(e) = controller.stop().await {
+        tracing::error!("Failed to stop voice input: {}", e);
+    }
+    setter.set_state(ButtonState::Idle);
+}
+
 /// Load the tray icon with modern appearance
 fn load_icon() -> Result<tray_icon::Icon> {
     let width = 32u32;
@@ -253,8 +309,8 @@ fn load_icon() -> Result<tray_icon::Icon> {
     let radius = (width.min(height) as f32 / 2.0) - 1.0;
 
     // Modern gradient colors (purple to blue)
-    let color_start = (139u8, 92u8, 246u8);  // Purple
-    let color_end = (59u8, 130u8, 246u8);    // Blue
+    let color_start = (139u8, 92u8, 246u8); // Purple
+    let color_end = (59u8, 130u8, 246u8); // Blue
 
     for y in 0..height {
         for x in 0..width {
@@ -265,9 +321,12 @@ fn load_icon() -> Result<tray_icon::Icon> {
             if dist <= radius {
                 // Gradient based on position (top-left to bottom-right)
                 let gradient_t = ((x as f32 / width as f32) + (y as f32 / height as f32)) / 2.0;
-                let r = (color_start.0 as f32 * (1.0 - gradient_t) + color_end.0 as f32 * gradient_t) as u8;
-                let g = (color_start.1 as f32 * (1.0 - gradient_t) + color_end.1 as f32 * gradient_t) as u8;
-                let b = (color_start.2 as f32 * (1.0 - gradient_t) + color_end.2 as f32 * gradient_t) as u8;
+                let r = (color_start.0 as f32 * (1.0 - gradient_t)
+                    + color_end.0 as f32 * gradient_t) as u8;
+                let g = (color_start.1 as f32 * (1.0 - gradient_t)
+                    + color_end.1 as f32 * gradient_t) as u8;
+                let b = (color_start.2 as f32 * (1.0 - gradient_t)
+                    + color_end.2 as f32 * gradient_t) as u8;
 
                 // Soft edge anti-aliasing
                 let alpha = if dist > radius - 1.5 {

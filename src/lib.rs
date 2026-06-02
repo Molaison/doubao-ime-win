@@ -11,5 +11,5 @@ pub mod ui;
 
 pub use asr::AsrClient;
 pub use audio::AudioCapture;
-pub use business::{HotkeyManager, TextInserter, VoiceController};
+pub use business::{HotkeyEvent, HotkeyManager, TextInserter, VoiceController};
 pub use data::{AppConfig, CredentialStore};
