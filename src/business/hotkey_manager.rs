@@ -1,7 +1,7 @@
 //! Hotkey Manager
 //!
 //! Manages global hotkeys for triggering voice input.
-//! Supports combo keys (Ctrl+Shift+V), double-tap of modifier keys (Ctrl), and tap/hold keys (Fn).
+//! Supports combo keys (Ctrl+Shift+V), double-tap of modifier keys (Ctrl), and tap/hold keys (Ctrl).
 
 use anyhow::{anyhow, Result};
 use global_hotkey::{
@@ -22,7 +22,7 @@ pub enum HotkeyMode {
     Combo,
     /// Double-tap mode (e.g., double-tap Ctrl)
     DoubleTap,
-    /// Tap/hold mode (e.g., tap Fn to toggle, hold Fn to record until released)
+    /// Tap/hold mode (e.g., tap Ctrl to toggle, hold Ctrl to record until released)
     TapHold,
 }
 
@@ -507,6 +507,7 @@ fn parse_tap_hold_target(key: &str) -> Result<TapHoldTarget> {
                 virtual_keys: vec![0xFF, 0x86, 0x87],
                 scan_codes: vec![0x63],
             });
+
         }
         "CTRL" | "CONTROL" => vec![VK_CONTROL.0, VK_LCONTROL.0, VK_RCONTROL.0],
         "SHIFT" => vec![VK_SHIFT.0, VK_LSHIFT.0, VK_RSHIFT.0],
