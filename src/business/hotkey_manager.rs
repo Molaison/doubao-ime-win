@@ -361,20 +361,13 @@ fn run_tap_hold_hook(
         WM_SYSKEYUP,
     };
 
-    let target_vks = match parse_tap_hold_virtual_keys(&key) {
-        Ok(vks) => vks,
+    let target = match parse_tap_hold_target(&key) {
+        Ok(target) => target,
         Err(e) => {
             tracing::error!("Invalid tap/hold key '{}': {}", key, e);
             return;
         }
     };
-
-    if key.eq_ignore_ascii_case("fn") {
-        tracing::warn!(
-            "Fn keys are not exposed as standard Windows virtual keys on many keyboards; \
-             if Fn does not trigger, configure tap_hold_key to another key."
-        );
-    }
 
     tracing::info!("Starting keyboard hook for tap/hold {} detection", key);
 
@@ -383,7 +376,7 @@ fn run_tap_hold_hook(
     }
 
     struct TapHoldHookState {
-        target_vks: Vec<u16>,
+        target: TapHoldTarget,
         hold_threshold: Duration,
         press_time: Option<Instant>,
         is_pressed: bool,
@@ -393,7 +386,7 @@ fn run_tap_hold_hook(
 
     HOOK_STATE.with(|state| {
         *state.borrow_mut() = Some(TapHoldHookState {
-            target_vks,
+            target,
             hold_threshold,
             press_time: None,
             is_pressed: false,
@@ -410,6 +403,7 @@ fn run_tap_hold_hook(
         if code >= 0 {
             let kb_struct = &*(lparam.0 as *const KBDLLHOOKSTRUCT);
             let vk_code = kb_struct.vkCode as u16;
+            let scan_code = kb_struct.scanCode;
             let message = wparam.0 as u32;
             let is_key_down = message == WM_KEYDOWN || message == WM_SYSKEYDOWN;
             let is_key_up = message == WM_KEYUP || message == WM_SYSKEYUP;
@@ -417,7 +411,7 @@ fn run_tap_hold_hook(
             HOOK_STATE.with(|state| {
                 if let Some(ref mut hook_state) = *state.borrow_mut() {
                     if !hook_state.is_active.load(Ordering::SeqCst)
-                        || !hook_state.target_vks.contains(&vk_code)
+                        || !hook_state.target.matches(vk_code, scan_code)
                     {
                         return;
                     }
@@ -475,15 +469,45 @@ fn run_tap_hold_hook(
 }
 
 #[cfg(target_os = "windows")]
-fn parse_tap_hold_virtual_keys(key: &str) -> Result<Vec<u16>> {
+#[derive(Debug, Clone)]
+struct TapHoldTarget {
+    virtual_keys: Vec<u16>,
+    scan_codes: Vec<u32>,
+}
+
+#[cfg(target_os = "windows")]
+impl TapHoldTarget {
+    fn from_virtual_keys(virtual_keys: Vec<u16>) -> Self {
+        Self {
+            virtual_keys,
+            scan_codes: Vec::new(),
+        }
+    }
+
+    fn matches(&self, vk_code: u16, scan_code: u32) -> bool {
+        self.virtual_keys.contains(&vk_code) || self.scan_codes.contains(&scan_code)
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn parse_tap_hold_target(key: &str) -> Result<TapHoldTarget> {
     use windows::Win32::UI::Input::KeyboardAndMouse::{
         VK_CONTROL, VK_ESCAPE, VK_LCONTROL, VK_LMENU, VK_LSHIFT, VK_MENU, VK_RCONTROL, VK_RMENU,
         VK_RSHIFT, VK_SHIFT, VK_SPACE,
     };
 
     let key_upper = key.trim().to_uppercase();
-    let vks = match key_upper.as_str() {
-        "FN" => vec![0xFF],
+    let virtual_keys = match key_upper.as_str() {
+        "FN" => {
+            // Windows does not define a standard VK_FN. Some keyboard firmware/drivers
+            // still expose standalone Fn presses to WH_KEYBOARD_LL as VK 0xFF, F23/F24,
+            // or the common Fn scan code 0x63. Match all known exposed forms so the
+            // default Fn tap/hold key works whenever Windows receives an Fn event.
+            return Ok(TapHoldTarget {
+                virtual_keys: vec![0xFF, 0x86, 0x87],
+                scan_codes: vec![0x63],
+            });
+        }
         "CTRL" | "CONTROL" => vec![VK_CONTROL.0, VK_LCONTROL.0, VK_RCONTROL.0],
         "SHIFT" => vec![VK_SHIFT.0, VK_LSHIFT.0, VK_RSHIFT.0],
         "ALT" => vec![VK_MENU.0, VK_LMENU.0, VK_RMENU.0],
@@ -506,7 +530,7 @@ fn parse_tap_hold_virtual_keys(key: &str) -> Result<Vec<u16>> {
         _ => return Err(anyhow!("Unknown tap/hold key: {}", key)),
     };
 
-    Ok(vks)
+    Ok(TapHoldTarget::from_virtual_keys(virtual_keys))
 }
 
 /// Parse a combo key string like "Ctrl+Shift+V"
