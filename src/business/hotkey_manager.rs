@@ -1,7 +1,7 @@
 //! Hotkey Manager
 //!
 //! Manages global hotkeys for triggering voice input.
-//! Supports combo keys (Ctrl+Shift+V), double-tap of modifier keys (Ctrl), and tap/hold keys (Ctrl).
+//! Supports combo keys (Ctrl+Shift+V), double-tap of modifier keys (Ctrl), and tap/hold keys (Right Alt).
 
 use anyhow::{anyhow, Result};
 use global_hotkey::{
@@ -22,7 +22,7 @@ pub enum HotkeyMode {
     Combo,
     /// Double-tap mode (e.g., double-tap Ctrl)
     DoubleTap,
-    /// Tap/hold mode (e.g., tap Ctrl to toggle, hold Ctrl to record until released)
+    /// Tap/hold mode (e.g., tap Right Alt to toggle, hold Right Alt to record until released)
     TapHold,
 }
 
@@ -79,8 +79,8 @@ impl HotkeyManager {
             HotkeyMode::DoubleTap => {
                 // For modifier keys like Ctrl, we use low-level keyboard hook.
                 // For regular keys, we can use global_hotkey.
-                let key_lower = config.double_tap_key.to_lowercase();
-                if key_lower == "ctrl" || key_lower == "shift" || key_lower == "alt" {
+                let key_lower = normalize_key_name(&config.double_tap_key);
+                if is_modifier_key_name(&key_lower) {
                     // Will use Windows keyboard hook for modifier keys.
                     tracing::info!(
                         "Double-tap modifier key: {} (using keyboard hook)",
@@ -142,9 +142,8 @@ impl HotkeyManager {
         let callback: Arc<dyn Fn(HotkeyEvent) + Send + Sync> = Arc::new(callback);
 
         // Check if we need to use keyboard hook for modifier keys
-        let key_lower = double_tap_key.to_lowercase();
-        let use_keyboard_hook = mode == HotkeyMode::DoubleTap
-            && (key_lower == "ctrl" || key_lower == "shift" || key_lower == "alt");
+        let key_lower = normalize_key_name(&double_tap_key);
+        let use_keyboard_hook = mode == HotkeyMode::DoubleTap && is_modifier_key_name(&key_lower);
 
         if mode == HotkeyMode::TapHold {
             #[cfg(target_os = "windows")]
@@ -220,6 +219,28 @@ impl HotkeyManager {
     }
 }
 
+fn normalize_key_name(key: &str) -> String {
+    key.trim()
+        .to_lowercase()
+        .replace([' ', '_', '-'], "")
+        .replace("control", "ctrl")
+}
+
+fn is_modifier_key_name(key: &str) -> bool {
+    matches!(
+        key,
+        "ctrl"
+            | "leftctrl"
+            | "rightctrl"
+            | "shift"
+            | "leftshift"
+            | "rightshift"
+            | "alt"
+            | "leftalt"
+            | "rightalt"
+    )
+}
+
 /// Windows keyboard hook for modifier key double-tap detection
 #[cfg(target_os = "windows")]
 fn run_modifier_double_tap_hook(
@@ -239,10 +260,16 @@ fn run_modifier_double_tap_hook(
     };
 
     // Determine which virtual keys to watch
-    let target_vks: Vec<u16> = match key.as_str() {
+    let target_vks: Vec<u16> = match normalize_key_name(&key).as_str() {
         "ctrl" => vec![VK_CONTROL.0, VK_LCONTROL.0, VK_RCONTROL.0],
+        "leftctrl" => vec![VK_LCONTROL.0],
+        "rightctrl" => vec![VK_RCONTROL.0],
         "shift" => vec![VK_LSHIFT.0, VK_RSHIFT.0],
+        "leftshift" => vec![VK_LSHIFT.0],
+        "rightshift" => vec![VK_RSHIFT.0],
         "alt" => vec![VK_LMENU.0, VK_RMENU.0],
+        "leftalt" => vec![VK_LMENU.0],
+        "rightalt" => vec![VK_RMENU.0],
         _ => vec![],
     };
 
@@ -408,6 +435,8 @@ fn run_tap_hold_hook(
             let is_key_down = message == WM_KEYDOWN || message == WM_SYSKEYDOWN;
             let is_key_up = message == WM_KEYUP || message == WM_SYSKEYUP;
 
+            let mut suppress_event = false;
+
             HOOK_STATE.with(|state| {
                 if let Some(ref mut hook_state) = *state.borrow_mut() {
                     if !hook_state.is_active.load(Ordering::SeqCst)
@@ -415,6 +444,11 @@ fn run_tap_hold_hook(
                     {
                         return;
                     }
+
+                    // The tap/hold key is owned by this app while the hook is active.
+                    // Suppress the original key event so Right Alt/AltGr does not also
+                    // reach the focused application or trigger its normal system behavior.
+                    suppress_event = is_key_down || is_key_up;
 
                     if is_key_down && !hook_state.is_pressed {
                         hook_state.is_pressed = true;
@@ -441,6 +475,10 @@ fn run_tap_hold_hook(
                     }
                 }
             });
+
+            if suppress_event {
+                return LRESULT(1);
+            }
         }
 
         CallNextHookEx(HHOOK::default(), code, wparam, lparam)
@@ -496,9 +534,9 @@ fn parse_tap_hold_target(key: &str) -> Result<TapHoldTarget> {
         VK_RSHIFT, VK_SHIFT, VK_SPACE,
     };
 
-    let key_upper = key.trim().to_uppercase();
-    let virtual_keys = match key_upper.as_str() {
-        "FN" => {
+    let key_name = normalize_key_name(key);
+    let virtual_keys = match key_name.as_str() {
+        "fn" => {
             // Windows does not define a standard VK_FN. Some keyboard firmware/drivers
             // still expose standalone Fn presses to WH_KEYBOARD_LL as VK 0xFF, F23/F24,
             // or the common Fn scan code 0x63. Match all known exposed forms so the
@@ -507,18 +545,23 @@ fn parse_tap_hold_target(key: &str) -> Result<TapHoldTarget> {
                 virtual_keys: vec![0xFF, 0x86, 0x87],
                 scan_codes: vec![0x63],
             });
-
         }
-        "CTRL" | "CONTROL" => vec![VK_CONTROL.0, VK_LCONTROL.0, VK_RCONTROL.0],
-        "SHIFT" => vec![VK_SHIFT.0, VK_LSHIFT.0, VK_RSHIFT.0],
-        "ALT" => vec![VK_MENU.0, VK_LMENU.0, VK_RMENU.0],
-        "SPACE" => vec![VK_SPACE.0],
-        "ESC" | "ESCAPE" => vec![VK_ESCAPE.0],
-        "ENTER" | "RETURN" => vec![0x0D],
+        "ctrl" => vec![VK_CONTROL.0, VK_LCONTROL.0, VK_RCONTROL.0],
+        "leftctrl" => vec![VK_LCONTROL.0],
+        "rightctrl" => vec![VK_RCONTROL.0],
+        "shift" => vec![VK_SHIFT.0, VK_LSHIFT.0, VK_RSHIFT.0],
+        "leftshift" => vec![VK_LSHIFT.0],
+        "rightshift" => vec![VK_RSHIFT.0],
+        "alt" => vec![VK_MENU.0, VK_LMENU.0, VK_RMENU.0],
+        "leftalt" => vec![VK_LMENU.0],
+        "rightalt" => vec![VK_RMENU.0],
+        "space" => vec![VK_SPACE.0],
+        "esc" | "escape" => vec![VK_ESCAPE.0],
+        "enter" | "return" => vec![0x0D],
         key if key.len() == 1 && key.as_bytes()[0].is_ascii_alphanumeric() => {
             vec![key.as_bytes()[0] as u16]
         }
-        key if key.starts_with('F') => {
+        key if key.starts_with('f') => {
             let number = key[1..]
                 .parse::<u16>()
                 .map_err(|_| anyhow!("Unknown tap/hold key: {}", key))?;
