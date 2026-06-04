@@ -435,6 +435,8 @@ fn run_tap_hold_hook(
             let is_key_down = message == WM_KEYDOWN || message == WM_SYSKEYDOWN;
             let is_key_up = message == WM_KEYUP || message == WM_SYSKEYUP;
 
+            let mut suppress_event = false;
+
             HOOK_STATE.with(|state| {
                 if let Some(ref mut hook_state) = *state.borrow_mut() {
                     if !hook_state.is_active.load(Ordering::SeqCst)
@@ -442,6 +444,11 @@ fn run_tap_hold_hook(
                     {
                         return;
                     }
+
+                    // The tap/hold key is owned by this app while the hook is active.
+                    // Suppress the original key event so Right Alt/AltGr does not also
+                    // reach the focused application or trigger its normal system behavior.
+                    suppress_event = is_key_down || is_key_up;
 
                     if is_key_down && !hook_state.is_pressed {
                         hook_state.is_pressed = true;
@@ -468,6 +475,10 @@ fn run_tap_hold_hook(
                     }
                 }
             });
+
+            if suppress_event {
+                return LRESULT(1);
+            }
         }
 
         CallNextHookEx(HHOOK::default(), code, wparam, lparam)
