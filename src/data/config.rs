@@ -130,7 +130,7 @@ fn default_double_tap_interval() -> u64 {
 }
 
 fn default_tap_hold_key() -> String {
-    "Ctrl".to_string()
+    "RightAlt".to_string()
 }
 
 fn default_tap_hold_threshold() -> u64 {
