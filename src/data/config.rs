@@ -18,6 +18,8 @@ pub struct AppConfig {
     pub floating_button: FloatingButtonConfig,
     #[serde(default)]
     pub asr: AsrConfig,
+    #[serde(default)]
+    pub text_insertion: TextInsertionConfig,
 }
 
 impl Default for AppConfig {
@@ -27,6 +29,7 @@ impl Default for AppConfig {
             hotkey: HotkeyConfig::default(),
             floating_button: FloatingButtonConfig::default(),
             asr: AsrConfig::default(),
+            text_insertion: TextInsertionConfig::default(),
         }
     }
 }
@@ -50,19 +53,43 @@ impl AppConfig {
         exe_dir.join("credentials.json")
     }
 
-    /// Load configuration from file or create default
+    /// Load configuration from file or create default.
+    ///
+    /// Existing config files are automatically migrated with the current
+    /// low-latency defaults so users get the fast path without learning or
+    /// manually adding new settings.
     pub fn load_or_default() -> Result<Self> {
         let path = Self::config_path();
 
         if path.exists() {
             let content = fs::read_to_string(&path)?;
             let config: AppConfig = toml::from_str(&content)?;
+            if config.needs_migration(&content) {
+                config.save()?;
+            }
             Ok(config)
         } else {
             let config = AppConfig::default();
             config.save()?;
             Ok(config)
         }
+    }
+
+    fn needs_migration(&self, content: &str) -> bool {
+        let required_keys = [
+            "low_latency_mode",
+            "enable_asr_twopass",
+            "enable_asr_threepass",
+            "interim_insert",
+            "interim_update_interval_ms",
+            "max_interim_rollback_chars",
+            "final_drain_timeout_ms",
+            "[text_insertion]",
+            "clipboard_threshold_chars",
+            "clipboard_restore_delay_ms",
+        ];
+
+        required_keys.iter().any(|key| !content.contains(key))
     }
 
     /// Save configuration to file
@@ -184,10 +211,82 @@ impl Default for FloatingButtonConfig {
 pub struct AsrConfig {
     #[serde(default = "default_true")]
     pub vad_enabled: bool,
+    #[serde(default = "default_true")]
+    pub low_latency_mode: bool,
+    #[serde(default = "default_true")]
+    pub enable_asr_twopass: bool,
+    #[serde(default = "default_false")]
+    pub enable_asr_threepass: bool,
+    #[serde(default = "default_true")]
+    pub interim_insert: bool,
+    #[serde(default = "default_interim_update_interval_ms")]
+    pub interim_update_interval_ms: u64,
+    #[serde(default = "default_max_interim_rollback_chars")]
+    pub max_interim_rollback_chars: usize,
+    #[serde(default = "default_final_drain_timeout_ms")]
+    pub final_drain_timeout_ms: u64,
+}
+
+fn default_false() -> bool {
+    false
+}
+
+fn default_interim_update_interval_ms() -> u64 {
+    150
+}
+
+fn default_max_interim_rollback_chars() -> usize {
+    6
+}
+
+fn default_final_drain_timeout_ms() -> u64 {
+    1500
 }
 
 impl Default for AsrConfig {
     fn default() -> Self {
-        Self { vad_enabled: true }
+        Self {
+            vad_enabled: true,
+            low_latency_mode: true,
+            enable_asr_twopass: true,
+            enable_asr_threepass: false,
+            interim_insert: true,
+            interim_update_interval_ms: default_interim_update_interval_ms(),
+            max_interim_rollback_chars: default_max_interim_rollback_chars(),
+            final_drain_timeout_ms: default_final_drain_timeout_ms(),
+        }
+    }
+}
+
+/// Text insertion configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TextInsertionConfig {
+    #[serde(default = "default_text_insert_mode")]
+    pub mode: String,
+    #[serde(default = "default_clipboard_threshold_chars")]
+    pub clipboard_threshold_chars: usize,
+    #[serde(default = "default_clipboard_restore_delay_ms")]
+    pub clipboard_restore_delay_ms: u64,
+}
+
+fn default_text_insert_mode() -> String {
+    "auto".to_string()
+}
+
+fn default_clipboard_threshold_chars() -> usize {
+    8
+}
+
+fn default_clipboard_restore_delay_ms() -> u64 {
+    80
+}
+
+impl Default for TextInsertionConfig {
+    fn default() -> Self {
+        Self {
+            mode: default_text_insert_mode(),
+            clipboard_threshold_chars: default_clipboard_threshold_chars(),
+            clipboard_restore_delay_ms: default_clipboard_restore_delay_ms(),
+        }
     }
 }

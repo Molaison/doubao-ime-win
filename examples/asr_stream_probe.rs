@@ -36,6 +36,10 @@ struct ProbeStats {
     first_response_at: Option<Duration>,
     first_text_at: Option<Duration>,
     first_interim_at: Option<Duration>,
+    microphone_started_at: Option<Duration>,
+    asr_session_started_at: Option<Duration>,
+    recording_stopped_at: Option<Duration>,
+    drain_completed_at: Option<Duration>,
     last_response_at: Option<Duration>,
     max_response_gap: Duration,
 }
@@ -54,14 +58,22 @@ async fn main() -> Result<()> {
     let credential_store = CredentialStore::new(&app_config)?;
     let credentials = credential_store.ensure_credentials().await?;
 
-    let audio_capture = AudioCapture::new()?;
-    let audio_rx = audio_capture.start()?;
-    let asr_client = AsrClient::new(credentials);
-    let mut result_rx = asr_client.start_realtime(audio_rx).await?;
-
-    println!("开始录音并发送到 ASR，请说话...");
     let started = Instant::now();
     let mut stats = ProbeStats::default();
+
+    let audio_capture = AudioCapture::new()?;
+    let audio_rx = audio_capture.start()?;
+    stats.microphone_started_at = Some(started.elapsed());
+
+    let asr_client = AsrClient::new(credentials, app_config.asr.clone());
+    let session_start = Instant::now();
+    let mut result_rx = asr_client.start_realtime(audio_rx).await?;
+    stats.asr_session_started_at = Some(started.elapsed());
+
+    println!(
+        "开始录音并发送到 ASR，请说话... ASR 会话准备耗时 {:.3}s",
+        session_start.elapsed().as_secs_f64()
+    );
 
     let recording_timer = tokio::time::sleep(probe_config.duration);
     tokio::pin!(recording_timer);
@@ -71,6 +83,7 @@ async fn main() -> Result<()> {
             _ = &mut recording_timer => {
                 println!("录音时间到，停止采集并等待服务端收尾...");
                 audio_capture.stop();
+                stats.recording_stopped_at = Some(started.elapsed());
                 break;
             }
             maybe_response = result_rx.recv() => {
@@ -98,6 +111,7 @@ async fn main() -> Result<()> {
         }
     }
 
+    stats.drain_completed_at = Some(started.elapsed());
     print_summary(&stats);
     Ok(())
 }
@@ -210,6 +224,22 @@ fn print_summary(stats: &ProbeStats) {
     println!("VAD start: {}", stats.vad_start);
     println!("错误数: {}", stats.errors);
     println!("会话正常结束: {}", stats.session_finished);
+    println!(
+        "麦克风启动耗时: {}",
+        format_duration(stats.microphone_started_at)
+    );
+    println!(
+        "ASR 会话可用耗时: {}",
+        format_duration(stats.asr_session_started_at)
+    );
+    println!(
+        "停止录音时间点: {}",
+        format_duration(stats.recording_stopped_at)
+    );
+    println!(
+        "收尾完成时间点: {}",
+        format_duration(stats.drain_completed_at)
+    );
     println!("首个响应延迟: {}", format_duration(stats.first_response_at));
     println!("首个文本延迟: {}", format_duration(stats.first_text_at));
     println!(

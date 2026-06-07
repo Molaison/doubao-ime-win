@@ -6,6 +6,8 @@ use prost::Message;
 use serde::Serialize;
 use serde_json::Value;
 
+use crate::data::AsrConfig;
+
 use super::proto::{AsrRequest, AsrResponse as AsrResponseProto, FrameState};
 
 /// Response types from ASR server
@@ -56,6 +58,8 @@ pub struct SessionConfig {
     pub audio_info: AudioInfo,
     pub enable_punctuation: bool,
     pub enable_speech_rejection: bool,
+    pub enable_vad: bool,
+    pub low_latency: bool,
     pub extra: SessionExtra,
 }
 
@@ -74,10 +78,11 @@ pub struct SessionExtra {
     pub enable_asr_threepass: bool,
     pub enable_asr_twopass: bool,
     pub input_mode: String,
+    pub interim_results: bool,
 }
 
 impl SessionConfig {
-    pub fn new(device_id: &str) -> Self {
+    pub fn new(device_id: &str, asr_config: &AsrConfig) -> Self {
         Self {
             audio_info: AudioInfo {
                 channel: 1,
@@ -86,13 +91,21 @@ impl SessionConfig {
             },
             enable_punctuation: true,
             enable_speech_rejection: false,
+            enable_vad: asr_config.vad_enabled,
+            low_latency: asr_config.low_latency_mode,
             extra: SessionExtra {
                 app_name: "com.android.chrome".to_string(),
-                cell_compress_rate: 8,
+                cell_compress_rate: if asr_config.low_latency_mode { 4 } else { 8 },
                 did: device_id.to_string(),
-                enable_asr_threepass: true,
-                enable_asr_twopass: true,
-                input_mode: "tool".to_string(),
+                enable_asr_threepass: asr_config.enable_asr_threepass,
+                enable_asr_twopass: asr_config.enable_asr_twopass,
+                input_mode: if asr_config.low_latency_mode {
+                    "realtime"
+                } else {
+                    "tool"
+                }
+                .to_string(),
+                interim_results: asr_config.interim_insert,
             },
         }
     }
@@ -248,7 +261,11 @@ pub fn parse_response(data: &[u8]) -> AsrResponse {
     }
 
     // Check for VAD start
-    if extra.get("vad_start").and_then(|v| v.as_bool()).unwrap_or(false) {
+    if extra
+        .get("vad_start")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+    {
         return AsrResponse {
             response_type: ResponseType::VadStart,
             vad_start: true,

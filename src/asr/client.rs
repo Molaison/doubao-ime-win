@@ -4,10 +4,14 @@
 
 use anyhow::{anyhow, Result};
 use futures_util::{SinkExt, StreamExt};
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use tokio::sync::mpsc;
-use tokio_tungstenite::{connect_async, tungstenite::Message};
+use tokio::net::TcpStream;
+use tokio::sync::{mpsc, Mutex};
+use tokio_tungstenite::{connect_async, tungstenite::Message, MaybeTlsStream, WebSocketStream};
 use uuid::Uuid;
+
+use crate::data::AsrConfig;
 
 use super::constants::*;
 use super::device::DeviceCredentials;
@@ -17,15 +21,34 @@ use super::protocol::{
     parse_response, AsrResponse, ResponseType, SessionConfig,
 };
 
+type AsrWebSocket = WebSocketStream<MaybeTlsStream<TcpStream>>;
+
+struct PreparedConnection {
+    request_id: String,
+    token: String,
+    ws_stream: AsrWebSocket,
+}
+
 /// ASR Client for real-time speech recognition
 pub struct AsrClient {
     credentials: DeviceCredentials,
+    asr_config: AsrConfig,
+    prepared_connection: Arc<Mutex<Option<PreparedConnection>>>,
 }
 
 impl AsrClient {
     /// Create a new ASR client with credentials
-    pub fn new(credentials: DeviceCredentials) -> Self {
-        Self { credentials }
+    pub fn new(credentials: DeviceCredentials, asr_config: AsrConfig) -> Self {
+        Self {
+            credentials,
+            asr_config,
+            prepared_connection: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    /// Backwards-compatible constructor that uses default ASR settings.
+    pub fn with_default_config(credentials: DeviceCredentials) -> Self {
+        Self::new(credentials, AsrConfig::default())
     }
 
     /// Get WebSocket URL with parameters
@@ -36,17 +59,45 @@ impl AsrClient {
         )
     }
 
-    /// Start real-time ASR session
-    ///
-    /// Returns a receiver for ASR responses
-    pub async fn start_realtime(
-        &self,
-        mut audio_rx: mpsc::Receiver<Vec<u8>>,
-    ) -> Result<mpsc::Receiver<AsrResponse>> {
+    /// Prepare a WebSocket task in the background so the next recording can skip
+    /// DNS/TLS/WebSocket handshake and StartTask latency.
+    pub async fn warm_up(&self) -> Result<()> {
+        if self.prepared_connection.lock().await.is_some() {
+            return Ok(());
+        }
+
+        match self.connect_and_start_task().await {
+            Ok(connection) => {
+                let mut prepared = self.prepared_connection.lock().await;
+                if prepared.is_none() {
+                    tracing::info!("ASR WebSocket warm-up completed");
+                    *prepared = Some(connection);
+                }
+                Ok(())
+            }
+            Err(e) => {
+                tracing::warn!("ASR WebSocket warm-up failed: {}", e);
+                Err(e)
+            }
+        }
+    }
+
+    async fn take_or_connect(&self) -> Result<PreparedConnection> {
+        let mut prepared = self.prepared_connection.lock().await;
+        if let Some(connection) = prepared.take() {
+            tracing::info!("Using pre-warmed ASR WebSocket connection");
+            return Ok(connection);
+        }
+        drop(prepared);
+
+        self.connect_and_start_task().await
+    }
+
+    async fn connect_and_start_task(&self) -> Result<PreparedConnection> {
         let url = self.ws_url();
         let request_id = Uuid::new_v4().to_string();
         let token = self.credentials.token.clone();
-        let device_id = self.credentials.device_id.clone();
+        let connect_started_at = Instant::now();
 
         // Build request with headers
         let request = tokio_tungstenite::tungstenite::http::Request::builder()
@@ -65,8 +116,85 @@ impl AsrClient {
             .body(())?;
 
         tracing::info!("Connecting to ASR WebSocket: {}", url);
-        let (ws_stream, _) = connect_async(request).await?;
-        tracing::info!("WebSocket connected successfully");
+        let (mut ws_stream, _) = connect_async(request).await?;
+        tracing::info!(
+            "WebSocket connected successfully in {:.1} ms",
+            connect_started_at.elapsed().as_secs_f64() * 1000.0
+        );
+
+        // Send StartTask
+        let task_started_at = Instant::now();
+        tracing::debug!("Sending StartTask (request_id: {})", &request_id[..8]);
+        let start_task_msg = build_start_task(&request_id, &token);
+        ws_stream.send(Message::Binary(start_task_msg)).await?;
+
+        // Wait for TaskStarted response
+        while let Some(message) = ws_stream.next().await {
+            if let Message::Binary(data) = message? {
+                let response = parse_response(&data);
+                if response.response_type == ResponseType::Error {
+                    return Err(anyhow!("StartTask failed: {}", response.error_msg));
+                }
+                if response.response_type == ResponseType::TaskStarted {
+                    tracing::debug!(
+                        "TaskStarted received in {:.1} ms",
+                        task_started_at.elapsed().as_secs_f64() * 1000.0
+                    );
+                    return Ok(PreparedConnection {
+                        request_id,
+                        token,
+                        ws_stream,
+                    });
+                }
+            }
+        }
+
+        Err(anyhow!("ASR WebSocket closed before TaskStarted"))
+    }
+
+    /// Start real-time ASR session
+    ///
+    /// Returns a receiver for ASR responses
+    pub async fn start_realtime(
+        &self,
+        mut audio_rx: mpsc::Receiver<Vec<u8>>,
+    ) -> Result<mpsc::Receiver<AsrResponse>> {
+        let PreparedConnection {
+            request_id,
+            token,
+            mut ws_stream,
+        } = self.take_or_connect().await?;
+        let device_id = self.credentials.device_id.clone();
+
+        // Send StartSession
+        let session_started_at = Instant::now();
+        tracing::debug!("Sending StartSession");
+        let session_config = SessionConfig::new(&device_id, &self.asr_config);
+        let start_session_msg = build_start_session(&request_id, &token, &session_config);
+        ws_stream.send(Message::Binary(start_session_msg)).await?;
+
+        // Wait for SessionStarted response
+        let mut session_started = false;
+        while let Some(message) = ws_stream.next().await {
+            if let Message::Binary(data) = message? {
+                let response = parse_response(&data);
+                if response.response_type == ResponseType::Error {
+                    return Err(anyhow!("StartSession failed: {}", response.error_msg));
+                }
+                if response.response_type == ResponseType::SessionStarted {
+                    tracing::debug!(
+                        "SessionStarted received in {:.1} ms",
+                        session_started_at.elapsed().as_secs_f64() * 1000.0
+                    );
+                    session_started = true;
+                    break;
+                }
+            }
+        }
+        if !session_started {
+            return Err(anyhow!("ASR WebSocket closed before SessionStarted"));
+        }
+
         let (mut write, mut read) = ws_stream.split();
 
         // Create response channel
@@ -75,35 +203,6 @@ impl AsrClient {
         // Clone values for tasks
         let request_id_clone = request_id.clone();
         let token_clone = token.clone();
-
-        // Send StartTask
-        tracing::debug!("Sending StartTask (request_id: {})", &request_id[..8]);
-        let start_task_msg = build_start_task(&request_id, &token);
-        write.send(Message::Binary(start_task_msg)).await?;
-
-        // Wait for TaskStarted response
-        if let Some(Ok(Message::Binary(data))) = read.next().await {
-            let response = parse_response(&data);
-            if response.response_type == ResponseType::Error {
-                return Err(anyhow!("StartTask failed: {}", response.error_msg));
-            }
-            tracing::debug!("TaskStarted received");
-        }
-
-        // Send StartSession
-        tracing::debug!("Sending StartSession");
-        let session_config = SessionConfig::new(&device_id);
-        let start_session_msg = build_start_session(&request_id, &token, &session_config);
-        write.send(Message::Binary(start_session_msg)).await?;
-
-        // Wait for SessionStarted response
-        if let Some(Ok(Message::Binary(data))) = read.next().await {
-            let response = parse_response(&data);
-            if response.response_type == ResponseType::Error {
-                return Err(anyhow!("StartSession failed: {}", response.error_msg));
-            }
-            tracing::debug!("SessionStarted received");
-        }
 
         // Spawn audio sending task
         tracing::info!("Starting audio frame sender task");
@@ -209,10 +308,6 @@ impl AsrClient {
                             );
                             let _ = result_tx_clone.send(response).await;
                             break;
-                        }
-                        ResponseType::Heartbeat => {
-                            // Ignore heartbeats
-                            continue;
                         }
                         ResponseType::InterimResult => {
                             interim_count += 1;
