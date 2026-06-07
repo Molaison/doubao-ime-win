@@ -1,7 +1,7 @@
 //! Hotkey Manager
 //!
 //! Manages global hotkeys for triggering voice input.
-//! Supports combo keys (Ctrl+Shift+V), double-tap of modifier keys (Ctrl), and tap/hold keys (Right Alt).
+//! Uses tap/hold keys (Right Alt by default) for triggering voice input.
 
 use anyhow::{anyhow, Result};
 use global_hotkey::{
@@ -54,9 +54,14 @@ impl HotkeyManager {
     /// Create a new hotkey manager based on configuration
     pub fn new(config: &HotkeyConfig) -> Result<Self> {
         let mode = match config.mode.as_str() {
-            "combo" => HotkeyMode::Combo,
-            "double_tap" => HotkeyMode::DoubleTap,
             "tap_hold" => HotkeyMode::TapHold,
+            "combo" | "double_tap" => {
+                tracing::warn!(
+                    "Hotkey mode '{}' is disabled; using tap_hold only",
+                    config.mode
+                );
+                HotkeyMode::TapHold
+            }
             other => {
                 tracing::warn!("Unknown hotkey mode '{}', falling back to tap_hold", other);
                 HotkeyMode::TapHold
