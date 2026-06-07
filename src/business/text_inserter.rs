@@ -131,6 +131,10 @@ impl TextInserter {
         let previous_clipboard = read_clipboard_text().ok().flatten();
 
         write_clipboard_text(text)?;
+        // Give the target app a short chance to observe the new clipboard
+        // contents before receiving Ctrl+V. Some Windows apps defer clipboard
+        // reads until their message loop handles the paste shortcut.
+        thread::sleep(Duration::from_millis(30));
         self.send_ctrl_v()?;
 
         if self.config.clipboard_restore_delay_ms > 0 {
@@ -231,7 +235,11 @@ impl TextInserter {
         let sent = unsafe { SendInput(inputs, size_of::<INPUT>() as i32) };
 
         if sent != inputs.len() as u32 {
-            tracing::warn!("SendInput sent {} of {} inputs", sent, inputs.len());
+            return Err(anyhow!(
+                "SendInput sent {} of {} inputs; target may be elevated or blocked",
+                sent,
+                inputs.len()
+            ));
         }
 
         Ok(())

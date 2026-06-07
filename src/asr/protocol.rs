@@ -8,6 +8,7 @@ use serde_json::Value;
 
 use crate::data::AsrConfig;
 
+use super::constants::APP_NAME;
 use super::proto::{AsrRequest, AsrResponse as AsrResponseProto, FrameState};
 
 /// Response types from ASR server
@@ -94,7 +95,7 @@ impl SessionConfig {
             enable_vad: asr_config.vad_enabled,
             low_latency: asr_config.low_latency_mode,
             extra: SessionExtra {
-                app_name: "com.android.chrome".to_string(),
+                app_name: APP_NAME.to_string(),
                 cell_compress_rate: if asr_config.low_latency_mode { 4 } else { 8 },
                 did: device_id.to_string(),
                 enable_asr_threepass: asr_config.enable_asr_threepass,
@@ -274,31 +275,44 @@ pub fn parse_response(data: &[u8]) -> AsrResponse {
         };
     }
 
-    // Parse recognition results
+    // Parse recognition results. The service has returned both array and
+    // object-shaped `results` payloads across versions, and text can be nested
+    // under a few common alternatives. Treat unknown-but-textual payloads as
+    // interim instead of dropping them silently, otherwise users see "recording"
+    // with no reaction.
     let results = results.unwrap();
     let mut text = String::new();
     let mut is_interim = true;
     let mut vad_finished = false;
     let mut nonstream_result = false;
 
-    if let Some(results_array) = results.as_array() {
-        for r in results_array {
-            if let Some(t) = r.get("text").and_then(|v| v.as_str()) {
-                text = t.to_string();
-            }
-            if r.get("is_interim").and_then(|v| v.as_bool()) == Some(false) {
-                is_interim = false;
-            }
-            if r.get("is_vad_finished").and_then(|v| v.as_bool()) == Some(true) {
-                vad_finished = true;
-            }
-            if r.get("extra")
-                .and_then(|e| e.get("nonstream_result"))
-                .and_then(|v| v.as_bool())
-                == Some(true)
-            {
-                nonstream_result = true;
-            }
+    for r in result_items(results) {
+        if let Some(t) = extract_result_text(r) {
+            text = t;
+        }
+        if r.get("is_interim")
+            .or_else(|| r.get("interim"))
+            .and_then(|v| v.as_bool())
+            == Some(false)
+        {
+            is_interim = false;
+        }
+        if r.get("is_final").and_then(|v| v.as_bool()) == Some(true) {
+            is_interim = false;
+        }
+        if r.get("is_vad_finished")
+            .or_else(|| r.get("vad_finished"))
+            .and_then(|v| v.as_bool())
+            == Some(true)
+        {
+            vad_finished = true;
+        }
+        if r.get("extra")
+            .and_then(|e| e.get("nonstream_result"))
+            .and_then(|v| v.as_bool())
+            == Some(true)
+        {
+            nonstream_result = true;
         }
     }
 
@@ -321,4 +335,34 @@ pub fn parse_response(data: &[u8]) -> AsrResponse {
             ..Default::default()
         }
     }
+}
+
+fn result_items(results: &Value) -> Vec<&Value> {
+    if let Some(results_array) = results.as_array() {
+        results_array.iter().collect()
+    } else {
+        vec![results]
+    }
+}
+
+fn extract_result_text(result: &Value) -> Option<String> {
+    for key in ["text", "utterance", "transcript"] {
+        if let Some(text) = result.get(key).and_then(|v| v.as_str()) {
+            if !text.is_empty() {
+                return Some(text.to_string());
+            }
+        }
+    }
+
+    for key in ["alternatives", "words", "utterances"] {
+        if let Some(items) = result.get(key).and_then(|v| v.as_array()) {
+            for item in items {
+                if let Some(text) = extract_result_text(item) {
+                    return Some(text);
+                }
+            }
+        }
+    }
+
+    None
 }

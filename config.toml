@@ -31,3 +31,24 @@ position_y = 100
 [asr]
 # 是否启用 VAD (语音活动检测)
 vad_enabled = true
+# 使用保守的 ASR 会话参数；如果服务端明确支持再改为 true
+low_latency_mode = false
+# 保守默认不启用 two-pass/three-pass，避免可选参数组合导致会话无识别结果
+enable_asr_twopass = false
+enable_asr_threepass = false
+# 是否写入 interim（临时识别结果），用于说话时立即有反馈
+interim_insert = true
+# interim 写入节流（毫秒）
+interim_update_interval_ms = 150
+# 避免 interim 大段删除重输
+max_interim_rollback_chars = 6
+# 停止录音后等待 final 的最长时间（毫秒）
+final_drain_timeout_ms = 1500
+
+[text_insertion]
+# 文本插入模式: "auto"、"clipboard" 或 "send_input"
+mode = "auto"
+# auto 模式下达到该字数使用剪贴板批量粘贴
+clipboard_threshold_chars = 8
+# Ctrl+V 后等待目标应用读取剪贴板再恢复原剪贴板（毫秒）
+clipboard_restore_delay_ms = 350
