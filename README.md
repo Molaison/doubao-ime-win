@@ -50,12 +50,9 @@ auto_start = false
 language = "zh-CN"
 
 [hotkey]
-mode = "tap_hold"
-combo_key = "Ctrl+Shift+V"
-double_tap_key = "Ctrl"
-double_tap_interval = 300  # 毫秒
-tap_hold_key = "RightAlt"    # 点击切换；按住启动、松开结束
-tap_hold_threshold = 300 # 按住判定阈值（毫秒）
+mode = "tap_hold"              # 当前仅启用 tap_hold；旧配置中的 combo/double_tap 会自动按 tap_hold 处理
+tap_hold_key = "RightAlt"      # 点击切换；按住启动、松开结束
+tap_hold_threshold = 300        # 按住判定阈值（毫秒）
 
 [floating_button]
 enabled = true  # 开始录音时显示状态窗口

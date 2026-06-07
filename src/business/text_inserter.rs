@@ -12,15 +12,13 @@ use crate::data::TextInsertionConfig;
 #[cfg(target_os = "windows")]
 use windows::core::w;
 #[cfg(target_os = "windows")]
-use windows::Win32::Foundation::{HANDLE, HGLOBAL, HWND};
+use windows::Win32::Foundation::{GlobalFree, HANDLE, HGLOBAL, HWND};
 #[cfg(target_os = "windows")]
 use windows::Win32::System::DataExchange::{
     CloseClipboard, EmptyClipboard, GetClipboardData, OpenClipboard, SetClipboardData,
 };
 #[cfg(target_os = "windows")]
-use windows::Win32::System::Memory::{
-    GlobalAlloc, GlobalFree, GlobalLock, GlobalUnlock, GMEM_MOVEABLE,
-};
+use windows::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE};
 #[cfg(target_os = "windows")]
 const CF_UNICODETEXT_FORMAT: u32 = 13;
 #[cfg(target_os = "windows")]
@@ -246,6 +244,16 @@ impl TextInserter {
 }
 
 #[cfg(target_os = "windows")]
+fn hglobal_from_handle(handle: HANDLE) -> HGLOBAL {
+    HGLOBAL(handle.0 as *mut std::ffi::c_void)
+}
+
+#[cfg(target_os = "windows")]
+fn handle_from_hglobal(hglobal: HGLOBAL) -> HANDLE {
+    HANDLE(hglobal.0 as isize)
+}
+
+#[cfg(target_os = "windows")]
 fn read_clipboard_text() -> Result<Option<String>> {
     let _guard = ClipboardGuard::open(HWND(0))?;
     let handle = unsafe { GetClipboardData(CF_UNICODETEXT_FORMAT) };
@@ -254,7 +262,7 @@ fn read_clipboard_text() -> Result<Option<String>> {
         _ => return Ok(None),
     };
 
-    let ptr = unsafe { GlobalLock(HGLOBAL(handle.0)) } as *const u16;
+    let ptr = unsafe { GlobalLock(hglobal_from_handle(handle)) } as *const u16;
     if ptr.is_null() {
         return Ok(None);
     }
@@ -266,7 +274,7 @@ fn read_clipboard_text() -> Result<Option<String>> {
         }
         let slice = std::slice::from_raw_parts(ptr, len);
         let text = String::from_utf16_lossy(slice);
-        let _ = GlobalUnlock(HGLOBAL(handle.0));
+        let _ = GlobalUnlock(hglobal_from_handle(handle));
         Ok(Some(text))
     }
 }
@@ -300,7 +308,7 @@ fn write_clipboard_text(text: &str) -> Result<()> {
             return Err(e.into());
         }
 
-        if let Err(e) = SetClipboardData(CF_UNICODETEXT_FORMAT, HANDLE(hglobal.0)) {
+        if let Err(e) = SetClipboardData(CF_UNICODETEXT_FORMAT, handle_from_hglobal(hglobal)) {
             let _ = GlobalFree(hglobal);
             return Err(e.into());
         }
