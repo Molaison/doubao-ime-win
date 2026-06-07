@@ -55,16 +55,15 @@ impl AppConfig {
 
     /// Load configuration from file or create default.
     ///
-    /// Existing config files are automatically migrated with the current
-    /// low-latency defaults so users get the fast path without learning or
-    /// manually adding new settings.
+    /// Existing config files are automatically migrated to the current safe
+    /// defaults so users do not have to learn or manually add new settings.
     pub fn load_or_default() -> Result<Self> {
         let path = Self::config_path();
 
         if path.exists() {
             let content = fs::read_to_string(&path)?;
-            let config: AppConfig = toml::from_str(&content)?;
-            if config.needs_migration(&content) {
+            let mut config: AppConfig = toml::from_str(&content)?;
+            if config.apply_safe_migrations(&content) || config.needs_migration(&content) {
                 config.save()?;
             }
             Ok(config)
@@ -73,6 +72,37 @@ impl AppConfig {
             config.save()?;
             Ok(config)
         }
+    }
+
+    fn apply_safe_migrations(&mut self, content: &str) -> bool {
+        let mut changed = false;
+
+        // The previous low-latency profile sent several optional ASR flags at
+        // once. Some Doubao sessions accept it, but when the service rejects or
+        // ignores that profile the UI appears to record while recognition never
+        // produces text. Prefer the conservative protocol unless the user keeps
+        // an explicit non-default override.
+        let legacy_aggressive_asr = content.contains("low_latency_mode = true")
+            && content.contains("enable_asr_twopass = true")
+            && content.contains("enable_asr_threepass = false")
+            && content.contains("interim_insert = true");
+        if legacy_aggressive_asr {
+            self.asr.low_latency_mode = false;
+            self.asr.enable_asr_twopass = false;
+            changed = true;
+        }
+
+        // 80 ms is too short for a number of Windows targets: they may process
+        // Ctrl+V after we have already restored the original clipboard, making
+        // clipboard insertion look like it did nothing.
+        if content.contains("clipboard_restore_delay_ms = 80")
+            && self.text_insertion.clipboard_restore_delay_ms <= 80
+        {
+            self.text_insertion.clipboard_restore_delay_ms = default_clipboard_restore_delay_ms();
+            changed = true;
+        }
+
+        changed
     }
 
     fn needs_migration(&self, content: &str) -> bool {
@@ -211,9 +241,9 @@ impl Default for FloatingButtonConfig {
 pub struct AsrConfig {
     #[serde(default = "default_true")]
     pub vad_enabled: bool,
-    #[serde(default = "default_true")]
+    #[serde(default = "default_false")]
     pub low_latency_mode: bool,
-    #[serde(default = "default_true")]
+    #[serde(default = "default_false")]
     pub enable_asr_twopass: bool,
     #[serde(default = "default_false")]
     pub enable_asr_threepass: bool,
@@ -247,8 +277,8 @@ impl Default for AsrConfig {
     fn default() -> Self {
         Self {
             vad_enabled: true,
-            low_latency_mode: true,
-            enable_asr_twopass: true,
+            low_latency_mode: false,
+            enable_asr_twopass: false,
             enable_asr_threepass: false,
             interim_insert: true,
             interim_update_interval_ms: default_interim_update_interval_ms(),
@@ -278,7 +308,7 @@ fn default_clipboard_threshold_chars() -> usize {
 }
 
 fn default_clipboard_restore_delay_ms() -> u64 {
-    80
+    350
 }
 
 impl Default for TextInsertionConfig {
