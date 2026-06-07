@@ -9,7 +9,7 @@ pub mod business;
 pub mod data;
 pub mod ui;
 
-pub use asr::AsrClient;
+pub use asr::{AsrClient, AsrResponse, ResponseType};
 pub use audio::AudioCapture;
 pub use business::{HotkeyEvent, HotkeyManager, TextInserter, VoiceController};
-pub use data::{AppConfig, CredentialStore};
+pub use data::{AppConfig, AsrConfig, CredentialStore, TextInsertionConfig};

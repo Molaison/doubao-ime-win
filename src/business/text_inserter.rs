@@ -2,28 +2,86 @@
 //!
 //! Inserts text into the currently focused window using keyboard simulation.
 
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use std::mem::size_of;
+use std::thread;
+use std::time::{Duration, Instant};
+
+use crate::data::TextInsertionConfig;
+
+#[cfg(target_os = "windows")]
+use windows::Win32::Foundation::{HANDLE, HGLOBAL, HWND};
+#[cfg(target_os = "windows")]
+use windows::Win32::System::DataExchange::{
+    CloseClipboard, EmptyClipboard, GetClipboardData, OpenClipboard, SetClipboardData,
+};
+#[cfg(target_os = "windows")]
+use windows::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE};
+#[cfg(target_os = "windows")]
+const CF_UNICODETEXT_FORMAT: u32 = 13;
+#[cfg(target_os = "windows")]
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP, KEYEVENTF_UNICODE,
-    VIRTUAL_KEY, VK_BACK,
+    VIRTUAL_KEY, VK_BACK, VK_CONTROL, VK_V,
 };
 
+#[cfg(not(target_os = "windows"))]
+#[derive(Clone, Copy)]
+struct INPUT;
+
+#[cfg(not(target_os = "windows"))]
+#[derive(Clone, Copy)]
+struct VIRTUAL_KEY;
+
+#[cfg(not(target_os = "windows"))]
+const VK_BACK: VIRTUAL_KEY = VIRTUAL_KEY;
+
 /// Text inserter service using Windows SendInput API
-pub struct TextInserter;
+pub struct TextInserter {
+    config: TextInsertionConfig,
+}
 
 impl TextInserter {
-    /// Create a new text inserter
+    /// Create a new text inserter with default settings.
     pub fn new() -> Self {
-        Self
+        Self::with_config(TextInsertionConfig::default())
     }
 
-    /// Insert text into the currently focused window
+    /// Create a new text inserter with explicit insertion settings.
+    pub fn with_config(config: TextInsertionConfig) -> Self {
+        Self { config }
+    }
+
+    /// Insert text with the configured fast path.
+    pub fn insert_fast(&self, text: &str) -> Result<()> {
+        if text.is_empty() {
+            return Ok(());
+        }
+
+        let mode = self.config.mode.to_ascii_lowercase();
+        let should_clipboard = mode == "clipboard"
+            || (mode == "auto" && text.chars().count() >= self.config.clipboard_threshold_chars);
+
+        if should_clipboard {
+            match self.insert_via_clipboard(text) {
+                Ok(()) => return Ok(()),
+                Err(e) if mode == "clipboard" => return Err(e),
+                Err(e) => {
+                    tracing::warn!("Clipboard insert failed, falling back to SendInput: {}", e)
+                }
+            }
+        }
+
+        self.insert(text)
+    }
+
+    /// Insert text into the currently focused window using Unicode SendInput.
     pub fn insert(&self, text: &str) -> Result<()> {
         if text.is_empty() {
             return Ok(());
         }
 
+        let started_at = Instant::now();
         let mut inputs: Vec<INPUT> = Vec::new();
 
         for ch in text.encode_utf16() {
@@ -34,6 +92,11 @@ impl TextInserter {
         }
 
         self.send_inputs(&inputs)?;
+        tracing::debug!(
+            "Inserted {} chars via SendInput in {:.1} ms",
+            text.chars().count(),
+            started_at.elapsed().as_secs_f64() * 1000.0
+        );
         Ok(())
     }
 
@@ -56,7 +119,52 @@ impl TextInserter {
         Ok(())
     }
 
+    #[cfg(target_os = "windows")]
+    fn insert_via_clipboard(&self, text: &str) -> Result<()> {
+        let started_at = Instant::now();
+        let previous_clipboard = read_clipboard_text().ok().flatten();
+
+        write_clipboard_text(text)?;
+        self.send_ctrl_v()?;
+
+        if self.config.clipboard_restore_delay_ms > 0 {
+            thread::sleep(Duration::from_millis(
+                self.config.clipboard_restore_delay_ms,
+            ));
+        }
+
+        if let Some(previous_text) = previous_clipboard {
+            if let Err(e) = write_clipboard_text(&previous_text) {
+                tracing::warn!("Failed to restore clipboard text: {}", e);
+            }
+        }
+
+        tracing::debug!(
+            "Inserted {} chars via clipboard paste in {:.1} ms",
+            text.chars().count(),
+            started_at.elapsed().as_secs_f64() * 1000.0
+        );
+        Ok(())
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    fn insert_via_clipboard(&self, _text: &str) -> Result<()> {
+        Err(anyhow!("clipboard insertion is only available on Windows"))
+    }
+
+    #[cfg(target_os = "windows")]
+    fn send_ctrl_v(&self) -> Result<()> {
+        let inputs = [
+            self.create_key_input(VK_CONTROL, true),
+            self.create_key_input(VK_V, true),
+            self.create_key_input(VK_V, false),
+            self.create_key_input(VK_CONTROL, false),
+        ];
+        self.send_inputs(&inputs)
+    }
+
     /// Create a Unicode character input
+    #[cfg(target_os = "windows")]
     fn create_unicode_input(&self, ch: u16, key_down: bool) -> INPUT {
         INPUT {
             r#type: INPUT_KEYBOARD,
@@ -76,7 +184,13 @@ impl TextInserter {
         }
     }
 
+    #[cfg(not(target_os = "windows"))]
+    fn create_unicode_input(&self, _ch: u16, _key_down: bool) -> INPUT {
+        INPUT
+    }
+
     /// Create a virtual key input
+    #[cfg(target_os = "windows")]
     fn create_key_input(&self, vk: VIRTUAL_KEY, key_down: bool) -> INPUT {
         INPUT {
             r#type: INPUT_KEYBOARD,
@@ -96,7 +210,13 @@ impl TextInserter {
         }
     }
 
+    #[cfg(not(target_os = "windows"))]
+    fn create_key_input(&self, _vk: VIRTUAL_KEY, _key_down: bool) -> INPUT {
+        INPUT
+    }
+
     /// Send inputs using Windows SendInput API
+    #[cfg(target_os = "windows")]
     fn send_inputs(&self, inputs: &[INPUT]) -> Result<()> {
         if inputs.is_empty() {
             return Ok(());
@@ -105,14 +225,84 @@ impl TextInserter {
         let sent = unsafe { SendInput(inputs, size_of::<INPUT>() as i32) };
 
         if sent != inputs.len() as u32 {
-            tracing::warn!(
-                "SendInput sent {} of {} inputs",
-                sent,
-                inputs.len()
-            );
+            tracing::warn!("SendInput sent {} of {} inputs", sent, inputs.len());
         }
 
         Ok(())
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    fn send_inputs(&self, _inputs: &[INPUT]) -> Result<()> {
+        Err(anyhow!("text insertion is only available on Windows"))
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn read_clipboard_text() -> Result<Option<String>> {
+    let _guard = ClipboardGuard::open()?;
+    let handle = unsafe { GetClipboardData(CF_UNICODETEXT_FORMAT) };
+    let handle = match handle {
+        Ok(handle) if !handle.is_invalid() => handle,
+        _ => return Ok(None),
+    };
+
+    let ptr = unsafe { GlobalLock(HGLOBAL(handle.0)) } as *const u16;
+    if ptr.is_null() {
+        return Ok(None);
+    }
+
+    let mut len = 0usize;
+    unsafe {
+        while *ptr.add(len) != 0 {
+            len += 1;
+        }
+        let slice = std::slice::from_raw_parts(ptr, len);
+        let text = String::from_utf16_lossy(slice);
+        let _ = GlobalUnlock(HGLOBAL(handle.0));
+        Ok(Some(text))
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn write_clipboard_text(text: &str) -> Result<()> {
+    let utf16: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
+    let byte_len = utf16.len() * size_of::<u16>();
+
+    let _guard = ClipboardGuard::open()?;
+    unsafe { EmptyClipboard()? };
+
+    let hglobal = unsafe { GlobalAlloc(GMEM_MOVEABLE, byte_len)? };
+    let ptr = unsafe { GlobalLock(hglobal) } as *mut u16;
+    if ptr.is_null() {
+        return Err(anyhow!("GlobalLock failed for clipboard buffer"));
+    }
+
+    unsafe {
+        std::ptr::copy_nonoverlapping(utf16.as_ptr(), ptr, utf16.len());
+        let _ = GlobalUnlock(hglobal);
+        SetClipboardData(CF_UNICODETEXT_FORMAT, HANDLE(hglobal.0))?;
+    }
+
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+struct ClipboardGuard;
+
+#[cfg(target_os = "windows")]
+impl ClipboardGuard {
+    fn open() -> Result<Self> {
+        unsafe { OpenClipboard(HWND(0))? };
+        Ok(Self)
+    }
+}
+
+#[cfg(target_os = "windows")]
+impl Drop for ClipboardGuard {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = CloseClipboard();
+        }
     }
 }
 

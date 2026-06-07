@@ -37,7 +37,10 @@ async fn main() -> Result<()> {
 async fn run_ui_mode() -> Result<()> {
     init_logging(false);
 
-    info!("Starting Doubao Voice Input v{} (UI Mode)", env!("CARGO_PKG_VERSION"));
+    info!(
+        "Starting Doubao Voice Input v{} (UI Mode)",
+        env!("CARGO_PKG_VERSION")
+    );
 
     // Initialize COM for Windows
     #[cfg(target_os = "windows")]
@@ -55,17 +58,27 @@ async fn run_ui_mode() -> Result<()> {
     // Initialize credentials
     let credential_store = CredentialStore::new(&config)?;
     let credentials = credential_store.ensure_credentials().await?;
-    info!("Device registered: {}", &credentials.device_id[..8.min(credentials.device_id.len())]);
+    info!(
+        "Device registered: {}",
+        &credentials.device_id[..8.min(credentials.device_id.len())]
+    );
 
     // Initialize components
     let audio_capture = Arc::new(AudioCapture::new()?);
-    let text_inserter = Arc::new(TextInserter::new());
-    let asr_client = Arc::new(AsrClient::new(credentials));
+    let text_inserter = Arc::new(TextInserter::with_config(config.text_insertion.clone()));
+    let asr_client = Arc::new(AsrClient::new(credentials, config.asr.clone()));
+    {
+        let warmup_client = asr_client.clone();
+        tokio::spawn(async move {
+            let _ = warmup_client.warm_up().await;
+        });
+    }
 
     let voice_controller = Arc::new(Mutex::new(VoiceController::new(
         asr_client,
         audio_capture,
         text_inserter,
+        config.asr.clone(),
     )));
 
     // Initialize hotkey manager
@@ -85,11 +98,17 @@ async fn run_cli_mode() -> Result<()> {
     init_logging(true);
 
     println!("╔═══════════════════════════════════════════════════════════╗");
-    println!("║     豆包语音输入 - CLI 验证版本 v{}        ║", env!("CARGO_PKG_VERSION"));
+    println!(
+        "║     豆包语音输入 - CLI 验证版本 v{}        ║",
+        env!("CARGO_PKG_VERSION")
+    );
     println!("╚═══════════════════════════════════════════════════════════╝");
     println!();
 
-    info!("Starting Doubao Voice Input v{} (CLI Mode)", env!("CARGO_PKG_VERSION"));
+    info!(
+        "Starting Doubao Voice Input v{} (CLI Mode)",
+        env!("CARGO_PKG_VERSION")
+    );
 
     // Step 1: Load configuration
     println!("[1/5] 加载配置...");
@@ -128,13 +147,20 @@ async fn run_cli_mode() -> Result<()> {
 
     // Step 4: Initialize components
     println!("[4/5] 初始化组件...");
-    let text_inserter = Arc::new(TextInserter::new());
-    let asr_client = Arc::new(AsrClient::new(credentials.clone()));
+    let text_inserter = Arc::new(TextInserter::with_config(config.text_insertion.clone()));
+    let asr_client = Arc::new(AsrClient::new(credentials.clone(), config.asr.clone()));
+    {
+        let warmup_client = asr_client.clone();
+        tokio::spawn(async move {
+            let _ = warmup_client.warm_up().await;
+        });
+    }
 
     let voice_controller = Arc::new(Mutex::new(VoiceController::new(
         asr_client.clone(),
         audio_capture.clone(),
         text_inserter.clone(),
+        config.asr.clone(),
     )));
     println!("      ✅ ASR 客户端、文本插入器已就绪");
 
@@ -208,7 +234,8 @@ async fn run_cli_mode() -> Result<()> {
 
                 tokio::time::sleep(std::time::Duration::from_secs(3)).await;
 
-                match text_inserter.insert("你好，这是豆包语音输入测试！Hello, this is a test!")
+                match text_inserter
+                    .insert_fast("你好，这是豆包语音输入测试！Hello, this is a test!")
                 {
                     Ok(_) => {
                         println!("✅ 文本插入成功");
@@ -258,12 +285,15 @@ async fn run_cli_mode() -> Result<()> {
 }
 
 fn init_logging(debug: bool) {
-    let level = if debug { "doubao_voice_input=debug" } else { "doubao_voice_input=info" };
-    
+    let level = if debug {
+        "doubao_voice_input=debug"
+    } else {
+        "doubao_voice_input=info"
+    };
+
     tracing_subscriber::registry()
         .with(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| level.into()),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| level.into()),
         )
         .with(tracing_subscriber::fmt::layer())
         .init();

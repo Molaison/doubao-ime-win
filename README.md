@@ -7,7 +7,8 @@ Windows 语音输入工具，基于豆包 ASR 实现实时语音识别。
 - 🎤 **实时语音识别** - 基于豆包 ASR 的高精度语音识别
 - ⌨️ **点击/按住 Right Alt 触发** - 点击 Right Alt 开始/停止语音输入，按住 Right Alt 录音、松开结束
 - 📍 **状态窗口** - 录音时出现的现代风格可拖动状态窗口，左键停止/切换录音，右键退出
-- 🔄 **流式识别** - 实时显示识别结果，支持文本修正
+- 🔄 **流式识别** - 通过 WebSocket 实时显示识别结果，支持文本修正
+- ⚡ **低延迟输入** - 预热 ASR WebSocket、停止后收尾等待 final，并支持剪贴板批量粘贴长文本
 - 🖥️ **系统托盘** - 托盘图标菜单控制，右键访问设置和退出
 - 📦 **绿色便携** - 单文件可执行，无需安装
 
@@ -41,7 +42,7 @@ Windows 语音输入工具，基于豆包 ASR 实现实时语音识别。
 
 ## 配置文件
 
-配置文件 `config.toml` 与程序同目录：
+配置文件 `config.toml` 与程序同目录。低延迟相关选项默认已经开启；旧配置文件会在启动时自动补齐这些默认值，通常无需手动修改：
 
 ```toml
 [general]
@@ -63,7 +64,29 @@ position_y = 100
 
 [asr]
 vad_enabled = true
+low_latency_mode = true              # 尽量使用低延迟会话参数
+enable_asr_twopass = true            # 兼顾速度和准确率
+enable_asr_threepass = false         # 关闭更慢的三段修正
+interim_insert = true                # false 时只在 final 后一次性写入
+interim_update_interval_ms = 150     # interim 写入节流
+max_interim_rollback_chars = 6       # 避免大段删除重输
+final_drain_timeout_ms = 1500        # 停止录音后等待 final 的最长时间
+
+[text_insertion]
+mode = "auto"                       # auto / clipboard / send_input
+clipboard_threshold_chars = 8        # 长文本用剪贴板批量粘贴
+clipboard_restore_delay_ms = 80      # 粘贴后恢复原剪贴板前的等待
 ```
+
+## 加速策略
+
+本项目已经使用 ASR WebSocket，不是“录完后 HTTP 上传”的批处理模式。为了降低“说完后很久才进框”和“一个一个输入”的体感延迟，主程序开箱即用地默认启用以下策略，无需用户理解或手动配置：
+
+- **WebSocket 预热**：启动后后台预建 ASR WebSocket 并完成 `StartTask`，下一次录音可减少连接握手延迟。
+- **停止后收尾**：停止麦克风后继续等待 `FinalResult`/`SessionFinished`，最多等待 `final_drain_timeout_ms`，避免过早退出导致 final 文本丢失。
+- **interim 节流**：interim 文本最多按 `interim_update_interval_ms` 写入一次；如果服务端改写太多字符，先跳过本次 interim，减少“删删打打”。
+- **剪贴板批量粘贴**：长文本默认走剪贴板 + `Ctrl+V`，短文本或剪贴板失败时回退到 Unicode `SendInput`。
+- **低延迟 ASR 参数**：可通过 `[asr]` 调整 two-pass / three-pass、VAD、低延迟模式和 interim/final 行为。
 
 ## 流式输出诊断
 
@@ -79,7 +102,9 @@ cargo run --example asr_stream_probe -- --duration 15 --drain-timeout 8
 
 探测结果会输出：
 - `Interim 流式响应`：大于 0 表示当前会话收到流式增量结果。
+- `麦克风启动耗时`、`ASR 会话可用耗时`：用于区分本地采集和 WebSocket/会话启动耗时。
 - `首个文本延迟`：从开始录音到首次收到非空识别文本的耗时。
+- `停止录音时间点`、`收尾完成时间点`：用于判断 final drain 是否过长。
 - `最大响应间隔`：响应之间的最大间隔，可用于判断“卡顿感”是否来自服务端响应不连续。
 - 结论行：直接提示本次会话是流式、疑似非流式，还是未收到文本结果。
 
