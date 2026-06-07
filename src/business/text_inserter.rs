@@ -10,19 +10,27 @@ use std::time::{Duration, Instant};
 use crate::data::TextInsertionConfig;
 
 #[cfg(target_os = "windows")]
+use windows::core::w;
+#[cfg(target_os = "windows")]
 use windows::Win32::Foundation::{HANDLE, HGLOBAL, HWND};
 #[cfg(target_os = "windows")]
 use windows::Win32::System::DataExchange::{
     CloseClipboard, EmptyClipboard, GetClipboardData, OpenClipboard, SetClipboardData,
 };
 #[cfg(target_os = "windows")]
-use windows::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE};
+use windows::Win32::System::Memory::{
+    GlobalAlloc, GlobalFree, GlobalLock, GlobalUnlock, GMEM_MOVEABLE,
+};
 #[cfg(target_os = "windows")]
 const CF_UNICODETEXT_FORMAT: u32 = 13;
 #[cfg(target_os = "windows")]
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP, KEYEVENTF_UNICODE,
     VIRTUAL_KEY, VK_BACK, VK_CONTROL, VK_V,
+};
+#[cfg(target_os = "windows")]
+use windows::Win32::UI::WindowsAndMessaging::{
+    CreateWindowExW, DestroyWindow, HWND_MESSAGE, WINDOW_EX_STYLE, WS_CHILD,
 };
 
 #[cfg(not(target_os = "windows"))]
@@ -239,7 +247,7 @@ impl TextInserter {
 
 #[cfg(target_os = "windows")]
 fn read_clipboard_text() -> Result<Option<String>> {
-    let _guard = ClipboardGuard::open()?;
+    let _guard = ClipboardGuard::open(HWND(0))?;
     let handle = unsafe { GetClipboardData(CF_UNICODETEXT_FORMAT) };
     let handle = match handle {
         Ok(handle) if !handle.is_invalid() => handle,
@@ -268,22 +276,81 @@ fn write_clipboard_text(text: &str) -> Result<()> {
     let utf16: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
     let byte_len = utf16.len() * size_of::<u16>();
 
-    let _guard = ClipboardGuard::open()?;
-    unsafe { EmptyClipboard()? };
+    // EmptyClipboard requires a real owner window before SetClipboardData can succeed.
+    let owner = ClipboardOwnerWindow::new()?;
+    let _guard = ClipboardGuard::open(owner.hwnd())?;
 
     let hglobal = unsafe { GlobalAlloc(GMEM_MOVEABLE, byte_len)? };
     let ptr = unsafe { GlobalLock(hglobal) } as *mut u16;
     if ptr.is_null() {
+        unsafe {
+            let _ = GlobalFree(hglobal);
+        }
         return Err(anyhow!("GlobalLock failed for clipboard buffer"));
     }
 
     unsafe {
         std::ptr::copy_nonoverlapping(utf16.as_ptr(), ptr, utf16.len());
         let _ = GlobalUnlock(hglobal);
-        SetClipboardData(CF_UNICODETEXT_FORMAT, HANDLE(hglobal.0))?;
+    }
+
+    unsafe {
+        if let Err(e) = EmptyClipboard() {
+            let _ = GlobalFree(hglobal);
+            return Err(e.into());
+        }
+
+        if let Err(e) = SetClipboardData(CF_UNICODETEXT_FORMAT, HANDLE(hglobal.0)) {
+            let _ = GlobalFree(hglobal);
+            return Err(e.into());
+        }
     }
 
     Ok(())
+}
+
+#[cfg(target_os = "windows")]
+struct ClipboardOwnerWindow(HWND);
+
+#[cfg(target_os = "windows")]
+impl ClipboardOwnerWindow {
+    fn new() -> Result<Self> {
+        let hwnd = unsafe {
+            CreateWindowExW(
+                WINDOW_EX_STYLE(0),
+                w!("STATIC"),
+                w!("DoubaoClipboardOwner"),
+                WS_CHILD,
+                0,
+                0,
+                0,
+                0,
+                HWND_MESSAGE,
+                None,
+                None,
+                None,
+            )
+        };
+
+        if hwnd.0 == 0 {
+            return Err(anyhow!("failed to create clipboard owner window"));
+        }
+
+        Ok(Self(hwnd))
+    }
+
+    fn hwnd(&self) -> HWND {
+        self.0
+    }
+}
+
+#[cfg(target_os = "windows")]
+impl Drop for ClipboardOwnerWindow {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = DestroyWindow(self.0);
+        }
+    }
 }
 
 #[cfg(target_os = "windows")]
@@ -291,8 +358,8 @@ struct ClipboardGuard;
 
 #[cfg(target_os = "windows")]
 impl ClipboardGuard {
-    fn open() -> Result<Self> {
-        unsafe { OpenClipboard(HWND(0))? };
+    fn open(owner: HWND) -> Result<Self> {
+        unsafe { OpenClipboard(owner)? };
         Ok(Self)
     }
 }
